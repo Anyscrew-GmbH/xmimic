@@ -26,7 +26,7 @@ import numpy as np
 from . import nets
 from .kin import Kinematics
 from .mdp import MAX_STEP_REWARD, MDP
-from .model import load_model
+from .model import feet_of, load_model
 from .motion import GOAL_Q_OFFSET, load_motion
 from .sim import Sim
 
@@ -53,9 +53,9 @@ def main(argv=None):
     files = sorted(glob.glob(os.path.join(args.run_dir, "ckpt_*.npz")))[:: args.every]
     assert files, args.run_dir
     cfg = json.loads(str(np.load(files[0])["meta"]))["args"]
-    mj, meta = load_model()
+    mj, meta = load_model(cfg.get("robot_dir"))
     kin = Kinematics(meta)
-    feet = [meta["tracked_bodies"].index(b) for b in ("left_ankle_roll_link", "right_ankle_roll_link")]
+    feet = feet_of(meta)
     motion = load_motion(args.motion_dir or cfg["motion_dir"], kin, feet)
     C = len(motion.names)
     K, Hh = cfg["goal_frames"], cfg["hist"]
@@ -70,7 +70,7 @@ def main(argv=None):
         params = jax.tree.map(lambda *x: jnp.stack(x), *[c[0] for c in cks])
         bufs = jax.tree.map(lambda *x: jnp.stack(x), *[c[1] for c in cks])
         sim = Sim(mj, meta, N, None, eval_mode=True)
-        mdp = MDP(kin, meta["default_joint_pos"], feet, sim.layout.dim)
+        mdp = MDP(kin, meta["default_joint_pos"], feet, sim.layout.dim, meta["contact_z"])
         sim.mdp = mdp
         clip_of = jnp.arange(N) % C
         model_b, st = sim.init(jax.random.PRNGKey(0), motion)

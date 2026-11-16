@@ -24,7 +24,7 @@ from . import nets, optim
 from .config import Config
 from .kin import Kinematics
 from .mdp import MDP, flatten_state, inv_dim, obs_dim, state_dim, unflatten_state
-from .model import load_model
+from .model import feet_of, load_model
 from .motion import CONTROL_DT, GOAL_Q_OFFSET, load_motion
 from .sim import Sim
 
@@ -43,16 +43,23 @@ def flat32(tree):
 
 
 class Mirror:
-    """Sagittal mirror M = diag(1, -1, 1) of states, joints (left/right swapped, roll and yaw joints negated) and the sim
-    context (blinkmimic/mirror.py): world-model data augmentation."""
+    """Sagittal mirror M = diag(1, -1, 1) of states, joints (left/right swapped, signs from the joint axes) and the sim
+    context (blinkmimic/mirror.py): world-model data augmentation.
 
-    def __init__(self, joint_names, layout):
-        names = list(joint_names)
+    A rotation by q about the axis a mirrors to a rotation by q about -M a. So a joint whose mirror partner (itself, for a
+    joint on the centerline) has the axis -M a keeps its angle's sign, and one whose partner has M a flips it. For the G1
+    this is BlinkMimic's rule: roll and yaw joints are negated (tests/test_mirror.py)."""
+
+    def __init__(self, meta, layout):
+        names = list(meta["joint_names"])
+        axis = {names[j]: np.asarray(a) for j, a in zip(meta["kin_joint_idx"], meta["kin_axes"]) if j >= 0}
         perm, sign = [], []
         for n in names:
             partner = n.replace("left_", "@").replace("right_", "left_").replace("@", "right_")
             perm.append(names.index(partner))
-            sign.append(-1.0 if any(f"_{t}_" in n for t in ("roll", "yaw")) else 1.0)
+            s = -float(axis[partner] @ (axis[n] * [1.0, -1.0, 1.0]))
+            assert abs(abs(s) - 1) < 1e-4, f"{n} and {partner} are not mirror images: axes {axis[n]}, {axis[partner]}"
+            sign.append(float(np.sign(s)))
         self.perm, self.sign = np.asarray(perm), np.asarray(sign, np.float32)
         self.M = np.asarray([1.0, -1.0, 1.0], np.float32)
         self.layout = layout
@@ -79,16 +86,16 @@ class XMimic:
         build the trainer without it and run the probe sweeps elsewhere."""
         self.cfg = c = cfg
         nets.MM_OUT = jnp.bfloat16  # torch-autocast matmul outputs (see nets.MM_OUT)
-        self.mj_model, self.meta = load_model()
+        self.mj_model, self.meta = load_model(c.robot_dir)
         assert c.njmax > 0, "--njmax must be positive (BlinkMimic: 500)"
         self.meta["sim"]["njmax"] = c.njmax
         meta = self.meta
         self.J = J = len(meta["joint_names"])
         self.kin = Kinematics(meta)
-        feet = [meta["tracked_bodies"].index(b) for b in ("left_ankle_roll_link", "right_ankle_roll_link")]
+        feet = feet_of(meta)
         self.sim = Sim(self.mj_model, meta, c.num_envs, None, gamma=c.gamma, fail_reset=c.fail_reset)
         self.layout = self.sim.layout
-        self.mdp = MDP(self.kin, meta["default_joint_pos"], feet, self.layout.dim)
+        self.mdp = MDP(self.kin, meta["default_joint_pos"], feet, self.layout.dim, meta["contact_z"])
         self.sim.mdp = self.mdp
         self.motion = load_motion(c.motion_dir, self.kin, feet)
         self.goal_dim = self.motion.goal_dim(c.goal_frames)
@@ -97,7 +104,7 @@ class XMimic:
         self.wm_in = inv_dim(J) + J + self.layout.dim
         self.wm_out = 12 + 2 * J
         self.ref = (GOAL_Q_OFFSET, np.asarray(meta["default_joint_pos"], np.float32), np.asarray(meta["action_scale"], np.float32))
-        self.mirror = Mirror(meta["joint_names"], self.layout)
+        self.mirror = Mirror(meta, self.layout)
         self.err_floor = np.concatenate([np.full((n,), v, np.float32) for n, v in ERR_FLOOR_PARTS]
                                         + [np.full((J,), 3e-3, np.float32), np.full((J,), 5e-2, np.float32)])  # fmt: skip
         self.n_mirror = int(c.wm_batch * c.wm_mirror)

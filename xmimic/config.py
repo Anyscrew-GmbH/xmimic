@@ -64,6 +64,7 @@ class Config:
     ckpt_every: int = 100
     seed: int = 0
     motion_dir: str = "data/lafan1_g1"
+    robot_dir: str = ""  # directory with the robot's scene.xml and meta.json ("": the bundled G1, assets/g1)
     log_dir: str = "runs/xmimic"
     max_minutes: float = 0.0  # stop after this much training time (0: run all iterations)
     # ---- layout and learner

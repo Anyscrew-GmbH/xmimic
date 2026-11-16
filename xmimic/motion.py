@@ -25,9 +25,9 @@ GOAL_Q_OFFSET = 15  # index of q(f+1) in the goal vector (first future frame: dp
 
 
 def load_lafan1_csv(path: str):
-    """30 fps rows of root position, root quaternion (xyzw) and 29 joint angles -> (p, quat wxyz, q, fps)."""
+    """30 fps rows of root position, root quaternion (xyzw) and the joint angles (29 for the G1) -> (p, quat wxyz, q, fps)."""
     raw = np.loadtxt(path, delimiter=",")
-    p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
+    p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:]
     return p, np.concatenate((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1), j, 30.0
 
 
@@ -148,6 +148,7 @@ def load_motion(motion_dir: str, kin, feet: list[int], margin: float = 0.015, vm
     ps, Rs, vs, ws, js, jds, lens = [], [], [], [], [], [], []
     for f in files:
         p, quat, j, fps = load_lafan1_csv(f)
+        assert j.shape[1] == len(kin.q_lo), f"{f}: {j.shape[1]} joint columns, the robot has {len(kin.q_lo)} joints"
         p, quat, j = (x.astype(np.float32) for x in (p, quat, j))
         T_src = p.shape[0]
         dur = (T_src - 1) / fps

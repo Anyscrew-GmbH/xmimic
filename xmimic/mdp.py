@@ -57,8 +57,8 @@ class MDP:
     """Observation, reward (BeyondMimic's tracking terms plus InstantTrack's contact term), hard and soft termination, and
     the critic's privileged features."""
 
-    def __init__(self, kin, default_q, feet: list[int], xi_dim: int):
-        self.kin = kin
+    def __init__(self, kin, default_q, feet: list[int], xi_dim: int, contact_z: float = CONTACT_Z):
+        self.kin, self.contact_z = kin, contact_z
         J = len(default_q)
         self.J, self.xi_dim = J, xi_dim
         self.default_q = np.asarray(default_q, np.float32)
@@ -108,7 +108,7 @@ class MDP:
         r = (r_track + W_ACTION_RATE * r_rate + W_JOINT_LIMIT * r_lim) * CONTROL_DT
         if w_contact > 0:
             fz = bp[..., self.feet, 2]
-            c_sim = jax.nn.sigmoid((CONTACT_Z - fz) / 0.005)
+            c_sim = jax.nn.sigmoid((self.contact_z - fz) / 0.005)
             c_ref = motion.ref_contact[f]
             slip = (bv[..., self.feet, :2] ** 2).sum(-1)
             r_contact = (1 - (c_sim - c_ref) ** 2) + c_ref * jnp.exp(-slip / 0.3**2)

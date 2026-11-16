@@ -23,7 +23,7 @@ from xmimic.algorithm import ERR_FLOOR_PARTS, Mirror, widths  # noqa: E402
 from xmimic.config import Config  # noqa: E402
 from xmimic.kin import Kinematics  # noqa: E402
 from xmimic.mdp import MDP, flatten_state, inv_dim, obs_dim, state_dim, unflatten_state  # noqa: E402
-from xmimic.model import load_meta  # noqa: E402
+from xmimic.model import feet_of, load_meta  # noqa: E402
 from xmimic.motion import CONTROL_DT, GOAL_Q_OFFSET, load_motion  # noqa: E402
 from xmimic.rot import mm3, so3_exp  # noqa: E402
 from xmimic.sim import XiLayout  # noqa: E402
@@ -55,7 +55,7 @@ def build(cls, cfg: Config, clips=CLIPS):
     meta = xm.meta
     xm.J = J = len(meta["joint_names"])
     xm.kin = Kinematics(meta)
-    feet = [meta["tracked_bodies"].index(b) for b in ("left_ankle_roll_link", "right_ankle_roll_link")]
+    feet = feet_of(meta)
     xm.layout = XiLayout(meta)
     xm.mdp = MDP(xm.kin, meta["default_joint_pos"], feet, xm.layout.dim)
     xm.motion = motion_for(xm.kin, feet, clips)
@@ -65,7 +65,7 @@ def build(cls, cfg: Config, clips=CLIPS):
     xm.wm_in = inv_dim(J) + J + xm.layout.dim
     xm.wm_out = 12 + 2 * J
     xm.ref = (GOAL_Q_OFFSET, np.asarray(meta["default_joint_pos"], np.float32), np.asarray(meta["action_scale"], np.float32))
-    xm.mirror = Mirror(meta["joint_names"], xm.layout)
+    xm.mirror = Mirror(meta, xm.layout)
     xm.err_floor = np.concatenate([np.full((n,), v, np.float32) for n, v in ERR_FLOOR_PARTS]
                                   + [np.full((J,), 3e-3, np.float32), np.full((J,), 5e-2, np.float32)])  # fmt: skip
     xm.n_mirror = int(c.wm_batch * c.wm_mirror)

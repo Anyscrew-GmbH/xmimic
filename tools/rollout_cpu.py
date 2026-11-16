@@ -23,7 +23,7 @@ from xmimic import nets  # noqa: E402
 from xmimic.evaluate import load_ckpt  # noqa: E402
 from xmimic.kin import Kinematics  # noqa: E402
 from xmimic.mdp import MDP  # noqa: E402
-from xmimic.model import load_model  # noqa: E402
+from xmimic.model import feet_of, load_model  # noqa: E402
 from xmimic.motion import GOAL_Q_OFFSET, load_motion  # noqa: E402
 from xmimic.rot import mat_to_quat, mv3, quat_to_mat, tr3  # noqa: E402
 from xmimic.sim import DECIMATION, XiLayout  # noqa: E402
@@ -34,13 +34,13 @@ def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1"):
     jax.config.update("jax_platforms", "cpu")
     params, bufs, meta_ck = load_ckpt(ckpt)
     a = meta_ck["args"]
-    m, meta = load_model()
+    m, meta = load_model(a.get("robot_dir"))
     J = len(meta["joint_names"])
     kin = Kinematics(meta)
-    feet = [meta["tracked_bodies"].index(b) for b in ("left_ankle_roll_link", "right_ankle_roll_link")]
+    feet = feet_of(meta)
     motion = load_motion(motion_dir, kin, feet)
     layout = XiLayout(meta)
-    mdp = MDP(kin, meta["default_joint_pos"], feet, layout.dim)
+    mdp = MDP(kin, meta["default_joint_pos"], feet, layout.dim, meta["contact_z"])
     ref = (GOAL_Q_OFFSET, jnp.asarray(meta["default_joint_pos"], jnp.float32), jnp.asarray(meta["action_scale"], jnp.float32))
     m.geom_friction[np.asarray(meta["robot_geom_ids"]), 0] = 1.0  # evaluation friction
     d = mujoco.MjData(m)

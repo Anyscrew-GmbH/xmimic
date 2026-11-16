@@ -17,14 +17,27 @@ import numpy as np
 ASSETS = Path(__file__).resolve().parent.parent / "assets" / "g1"
 
 
-def load_meta(path: Path = ASSETS) -> dict:
-    """Robot metadata: joint and body order, actuators, default pose, action scale, domain randomization, solver options."""
-    return json.loads((path / "meta.json").read_text())
+def load_meta(path=None) -> dict:
+    """Robot metadata: joint and body order, actuators, default pose, action scale, domain randomization, solver options.
+    ``path``: a robot directory with scene.xml and meta.json (--robot_dir); None or "" is the bundled G1. Keys that only
+    other robots need default to the G1's values: ``feet`` (the two tracked bodies that are the feet), ``contact_z`` (the
+    foot-body height below which a foot counts as in contact) and ``exact`` (model fields restored after loading)."""
+    meta = json.loads((Path(path or ASSETS) / "meta.json").read_text())
+    meta.setdefault("feet", ["left_ankle_roll_link", "right_ankle_roll_link"])
+    meta.setdefault("contact_z", 0.045)
+    meta.setdefault("exact", {})
+    return meta
 
 
-def load_model(path: Path = ASSETS) -> tuple[mujoco.MjModel, dict]:
-    """(MjModel with BlinkMimic's solver options and exact parameter values, metadata)."""
-    if not (path / "assets" / "meshes").is_dir():
+def feet_of(meta: dict) -> list[int]:
+    """Indices of the feet among the tracked bodies."""
+    return [meta["tracked_bodies"].index(b) for b in meta["feet"]]
+
+
+def load_model(path=None) -> tuple[mujoco.MjModel, dict]:
+    """(MjModel with the solver options and exact parameter values of meta.json, metadata) of a robot directory."""
+    path = Path(path or ASSETS)
+    if path == ASSETS and not (path / "assets" / "meshes").is_dir():
         raise FileNotFoundError(f"G1 meshes not found in {path / 'assets' / 'meshes'}: run tools/download_data.sh first")
     meta = load_meta(path)
     m = mujoco.MjModel.from_xml_path(str(path / "scene.xml"))
