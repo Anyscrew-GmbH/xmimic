@@ -5,6 +5,12 @@ Domain randomization is BlinkMimic's G1 default (dr.py): the contact friction of
 offset once per world, joint encoder offsets once per episode. Together they form the sim context
 xi = (friction, joint offsets, CoM offset), which the world model and the critic see.
 
+Optional, for a robot whose drives were identified (off for the G1): meta["dr"]["actuator"] = {"kp": [lo, hi], "kd": ...,
+"armature": ..., "frictionloss": ...}, any subset. Every joint draws its own factor on the nominal value once per world; the
+factors are appended to xi. kp and kd assume position actuators in MuJoCo's affine form (gainprm kp, biasprm 0 -kp -kd).
+meta["dr"]["action_delay"] = p: with probability p an episode applies every action one control step late (20 ms; the
+evaluation delays if p >= 0.5). The flag is the last entry of xi, and the world model is given the applied action.
+
 A detail reproduced on purpose: BlinkMimic selects the ground as the geoms of body 0, but mjlab puts the plane on its own
 body, so the selection is empty and the floor keeps friction 1.0. MuJoCo takes the larger friction of a contact pair, so the
 robot's friction randomization U(0.3, 1.2) only acts within [1.0, 1.2]. XMimic changes only the robot geoms, as BlinkMimic.
@@ -22,11 +28,13 @@ from .motion import BIN_FRAMES
 from .rot import mat_to_quat, mv3, quat_to_mat, so3_exp, tr3
 
 DECIMATION = 4
+ACTUATOR_FIELDS = {"kp": ("actuator_gainprm", "actuator_biasprm"), "kd": ("actuator_biasprm",), "armature": ("dof_armature",),
+                   "frictionloss": ("dof_frictionloss",)}  # the model fields each randomized actuator constant scales
 
 
 class XiLayout:
-    """Layout of the sim context xi = (friction 1, joint offsets J, CoM offset 3) and its normalization (center and
-    half-range, as blinkmimic.dr.XiLayout)."""
+    """Layout of the sim context xi = (friction 1, joint offsets J, CoM offset 3, then J factors per randomized actuator
+    constant) and its normalization (center and half-range, as blinkmimic.dr.XiLayout)."""
 
     def __init__(self, meta: dict):
         J = len(meta["joint_names"])
@@ -38,6 +46,22 @@ class XiLayout:
         half = meta["dr"]["joint_offset"].get(".*", 0.01)
         self.offset_half = np.full((J,), max(half, 1e-6), np.float32)
         self.scale = np.asarray([(hi - lo) / 2] + [max(half, 1e-6)] * J + [0.05] * 3, np.float32)
+        self.factors = {}  # actuator constant -> (slice of xi, lo, hi)
+        for name, (lo, hi) in meta["dr"].get("actuator", {}).items():
+            assert name in ("kp", "kd", "armature", "frictionloss"), name
+            self.factors[name] = (slice(self.dim, self.dim + J), lo, hi)
+            self.dim += J
+            self.center = np.append(self.center, np.full(J, (lo + hi) / 2, np.float32))
+            self.scale = np.append(self.scale, np.full(J, max((hi - lo) / 2, 1e-6), np.float32))
+        self.delay_p, self.delay = meta["dr"].get("action_delay", 0.0), None
+        if self.delay_p > 0:
+            self.delay = self.dim  # xi[..., delay] = 1: this episode's actions act one control step late
+            self.dim += 1
+            self.center, self.scale = np.append(self.center, np.float32(0.5)), np.append(self.scale, np.float32(0.5))
+
+    def applied(self, a, a_prev, xi):
+        """The action that moves the joint targets in a step: the policy's, or the previous one in a delayed episode."""
+        return a if self.delay is None else jnp.where(xi[..., self.delay, None] > 0.5, a_prev, a)
 
     def normalize(self, xi):
         return (xi - self.center) / self.scale
@@ -77,12 +101,14 @@ class Sim:
         self.mx = mjx.put_model(mj_model, impl="warp", device=device, graph_mode=JaxCallableGraphMode.WARP)
         self.dx0 = mjx.make_data(mj_model, impl="warp", device=device, naconmax=num_envs * meta["sim"]["nconmax"], njmax=meta["sim"]["njmax"])
         self.model_axes = jax.tree.map(lambda _: None, self.mx).replace(geom_friction=0, body_ipos=0)
+        self.model_axes = self.model_axes.replace(**{f: 0 for n in self.layout.factors for f in ACTUATOR_FIELDS[n]})
 
     # ------------------------------------------------------------------ setup
     def init(self, key, motion):
         """Batched model (per-env friction and CoM), initial env state, every world reset onto the reference."""
         N, L = self.N, self.layout
         kf, kc, kr = jax.random.split(key, 3)
+        ka = jax.random.fold_in(key, 1)  # its own stream: the three keys above stay as they are without actuator factors
         xi = jnp.zeros((N, L.dim))
         if self.eval_mode:
             fric = jnp.ones((N, 1))
@@ -92,11 +118,24 @@ class Sim:
             fric = jax.random.uniform(kf, (N, 1), minval=lo, maxval=hi)
             com = jax.random.uniform(kc, (N, 3), minval=self.com_range[:, 0], maxval=self.com_range[:, 1])
         xi = xi.at[:, L.friction].set(fric).at[:, L.com].set(com)
+        if L.delay is not None and self.eval_mode:
+            xi = xi.at[:, L.delay].set(float(L.delay_p >= 0.5))
         fr = jnp.broadcast_to(self.mx.geom_friction, (N,) + self.mx.geom_friction.shape)
         fr = fr.at[:, self.robot_geoms, 0].set(fric)
         ip = jnp.broadcast_to(self.mx.body_ipos, (N,) + self.mx.body_ipos.shape)
         ip = ip.at[:, self.com_body].add(com)
         model_b = self.mx.replace(geom_friction=fr, body_ipos=ip)
+        for (name, (sl, lo, hi)), k in zip(L.factors.items(), jax.random.split(ka, 4)):
+            fac = jnp.ones((N, self.J)) if self.eval_mode else jax.random.uniform(k, (N, self.J), minval=lo, maxval=hi)
+            xi = xi.at[:, sl].set(fac)
+            b = lambda name: jnp.broadcast_to(getattr(model_b, name), (N,) + getattr(self.mx, name).shape)  # noqa: E731
+            if name == "kp":
+                model_b = model_b.replace(actuator_gainprm=b("actuator_gainprm").at[:, self.act, 0].multiply(fac),
+                                          actuator_biasprm=b("actuator_biasprm").at[:, self.act, 1].multiply(fac))  # fmt: skip
+            elif name == "kd":
+                model_b = model_b.replace(actuator_biasprm=b("actuator_biasprm").at[:, self.act, 2].multiply(fac))
+            else:
+                model_b = model_b.replace(**{f"dof_{name}": b(f"dof_{name}").at[:, self.dadr].multiply(fac)})
         nb = motion.num_bins
         data = jax.vmap(lambda q: self.dx0.replace(qpos=q))(jnp.tile(self.dx0.qpos[None], (N, 1)))
         st = {
@@ -172,9 +211,16 @@ class Sim:
             L = self.layout
             new = (2 * jax.random.uniform(ks[7], (N, J)) - 1) * L.offset_half
             xi = xi.at[:, L.joint_offset].set(jnp.where(d1, new, xi[:, L.joint_offset]))
+            if L.delay is not None:
+                late = jax.random.bernoulli(jax.random.fold_in(ks[7], 1), L.delay_p, (N,)).astype(xi.dtype)
+                xi = xi.at[:, L.delay].set(jnp.where(d, late, xi[:, L.delay]))
+        a0 = 0.0
+        if self.layout.delay is not None:  # a delayed episode's first step applies a_prev: the action that holds the reset pose
+            hold = (q - self.default_q - xi[:, self.layout.joint_offset]) / self.alpha
+            a0 = jnp.where(xi[:, self.layout.delay, None] > 0.5, hold, 0.0)
         return {**st, "data": data, "xi": xi, "bin_w_avg": w_avg,
                 "f": jnp.where(d, frames, st["f"]), "ep_step": jnp.where(d, 0, st["ep_step"]),
-                "a_prev": jnp.where(d1, 0.0, st["a_prev"]), "start_bin": jnp.where(d, bins, st["start_bin"]),
+                "a_prev": jnp.where(d1, a0, st["a_prev"]), "start_bin": jnp.where(d, bins, st["start_bin"]),
                 "ep_disc_ret": jnp.where(d, 0.0, st["ep_disc_ret"]), "ep_ret": jnp.where(d, 0.0, st["ep_ret"])}  # fmt: skip
 
     # ------------------------------------------------------------------ step
@@ -195,7 +241,7 @@ class Sim:
         """Apply the action, run 4 physics substeps, label the transition (BlinkMimic TrackingSim.step_core)."""
         S = self.state(st["data"])
         f, xi, a_prev, ep_step = st["f"], st["xi"], st["a_prev"], st["ep_step"]
-        target = self.default_q + xi[:, self.layout.joint_offset] + self.alpha * a
+        target = self.default_q + xi[:, self.layout.joint_offset] + self.alpha * self.layout.applied(a, a_prev, xi)
         data = self.physics(model_b, st["data"], target)
         S1 = self.state(data)
         f1 = f + 1

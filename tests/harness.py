@@ -81,7 +81,9 @@ def _rand_xi(key, xm, shape):
     off = (2 * jax.random.uniform(ko, shape + (xm.J,)) - 1) * L.offset_half
     cr = np.asarray(xm.meta["com_range"], np.float32)
     com = jax.random.uniform(kc, shape + (3,), minval=cr[:, 0], maxval=cr[:, 1])
-    return jnp.concatenate((fr, off, com), -1)
+    fac = [jax.random.uniform(jax.random.fold_in(key, i), shape + (xm.J,), minval=lo, maxval=hi) for i, (_, lo, hi) in enumerate(L.factors.values())]
+    late = [jax.random.bernoulli(jax.random.fold_in(key, 9), L.delay_p, shape + (1,)).astype(jnp.float32)] * (L.delay is not None)
+    return jnp.concatenate((fr, off, com, *fac, *late), -1)
 
 
 def _noisy_state(key, S, scale=1.0):

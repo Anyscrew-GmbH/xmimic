@@ -75,6 +75,8 @@ class Mirror:
     def xi(self, xi):
         L = self.layout
         xi = xi.at[..., L.joint_offset].set(self.joints(xi[..., L.joint_offset]))
+        for sl, _, _ in L.factors.values():  # per-joint factors swap sides, without a sign
+            xi = xi.at[..., sl].set(xi[..., sl][..., self.perm])
         return xi.at[..., L.com.start + 1].set(-xi[..., L.com.start + 1])
 
 
@@ -180,7 +182,7 @@ class XMimic:
         buf = rb.add(carry["buf"], out)
         S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
         wb = carry["wm_b"]
-        wm_b = {"in_norm": nets.rn_update(wb["in_norm"], nets.wm_inputs(S0, out["a"], self.layout.normalize(out["xi"]))),
+        wm_b = {"in_norm": nets.rn_update(wb["in_norm"], nets.wm_inputs(S0, self.layout.applied(out["a"], out["a_prev"], out["xi"]), self.layout.normalize(out["xi"]))),
                 "out_norm": nets.rn_update(wb["out_norm"], nets.wm_targets(S0, S1, CONTROL_DT)),
                 "inc_norm": nets.rn_update(wb["inc_norm"], nets.increments(S0, S1))}  # fmt: skip
         env, tail = sim.step_tail(motion, env, out, k_tail)
@@ -208,7 +210,7 @@ class XMimic:
         xi_n = self.layout.normalize(w["xi"])
         preds = []
         for j in range(c.wm_window):
-            S = nets.wm_step(wm, wm_b, S, w["a"][:, j], xi_n[:, j], CONTROL_DT)
+            S = nets.wm_step(wm, wm_b, S, self.layout.applied(w["a"][:, j], w["a_prev"][:, j], w["xi"][:, j]), xi_n[:, j], CONTROL_DT)
             preds.append(S)
         S_hat = tuple(jnp.stack([P[i] for P in preds], 1) for i in range(6))
         std = jnp.maximum(nets.rn_std(wm_b["inc_norm"], 1e-4), self.err_floor)
@@ -255,7 +257,7 @@ class XMimic:
             S, oh, a_prev, f = carry
             z, g, k = x
             a = nets.pi_apply(pi, pi_b, oh, g, self.ref, z=z)
-            S1 = nets.wm_step(wm, wm_b, S, a, xi_n, CONTROL_DT)
+            S1 = nets.wm_step(wm, wm_b, S, self.layout.applied(a, a_prev, xi), xi_n, CONTROL_DT)
             f1 = f + 1
             o1 = mdp.add_noise(k, mdp.obs(motion, S1, a, xi, f1))
             return (S1, jnp.concatenate((oh[:, 1:], o1[:, None]), 1), a, f1), (S1, a, a_prev)

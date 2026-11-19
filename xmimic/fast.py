@@ -168,7 +168,7 @@ class FastXMimic(XMimic):
             z, gr, rr, nz, tp = x
             a, ins = self._mlp(pi["dec"], jnp.concatenate((z, hn), -1), jax.nn.elu, taps=tp, defer=defer)
             a = a + gr
-            S1, _ = self._wm_step(wm, wm_b, S, a, xi_n)
+            S1, _ = self._wm_step(wm, wm_b, S, self.layout.applied(a, a_prev, xi), xi_n)
             o1 = obs(S1, a, rr) + nz
             hn1 = jnp.concatenate((hn[:, D:], nets.rn_apply(on, o1)), -1)
             return (S1, hn1, a), (S1, a, a_prev, ins if defer else None)
@@ -310,7 +310,8 @@ class FastXMimic(XMimic):
         S, xi_n = pre["S0"], pre["xi_n"]
         preds, ins_all = [], []
         for j in range(c.wm_window):
-            S, ins = self._wm_step(wm, wm_b, S, w["a"][:, j], xi_n[:, j], taps=[t[j] for t in taps], defer=True)
+            a = self.layout.applied(w["a"][:, j], w["a_prev"][:, j], w["xi"][:, j])
+            S, ins = self._wm_step(wm, wm_b, S, a, xi_n[:, j], taps=[t[j] for t in taps], defer=True)
             preds.append(S)
             ins_all.append(ins)
         ph, Rh, vh, wh, qh, qdh = tuple(jnp.stack([P[i] for P in preds], 1) for i in range(6))

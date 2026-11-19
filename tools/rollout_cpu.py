@@ -48,6 +48,7 @@ def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1"):
     fq, fd = meta["free_qpos_adr"], meta["free_dof_adr"]
     default_q, alpha = np.asarray(meta["default_joint_pos"], np.float64), np.asarray(meta["action_scale"], np.float64)
     xi = jnp.zeros((1, layout.dim))  # no randomization: zero joint offsets
+    late = layout.delay_p >= 0.5  # the evaluation's action delay (Sim.init)
 
     def state(qpos, qvel):  # as Sim.state, for one world
         R = quat_to_mat(qpos[None, fq + 3 : fq + 7])
@@ -70,7 +71,7 @@ def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1"):
     d.qvel[fd : fd + 3], d.qvel[fd + 3 : fd + 6], d.qvel[dadr] = v, R.T @ w, qd
     d.ctrl[act] = q
     mujoco.mj_forward(m, d)
-    a_prev = jnp.zeros(J)
+    a_prev = jnp.asarray((q - default_q) / alpha, jnp.float32) if late else jnp.zeros(J)  # as Sim.reset_masked
     o, _ = observe(d.qpos, d.qvel, a_prev, jnp.int32(f))
     hist = jnp.broadcast_to(o, (a["hist"], o.shape[-1]))
     out = {"qpos": [d.qpos.copy()], "f": [f], "alive": [True]}
@@ -79,7 +80,7 @@ def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1"):
         if t > 0:
             hist = jnp.concatenate((hist[1:], o[None]), 0)
         a_t = policy(hist, jnp.int32(f))
-        d.ctrl[act] = default_q + alpha * np.asarray(a_t, np.float64)
+        d.ctrl[act] = default_q + alpha * np.asarray(a_prev if late else a_t, np.float64)
         for _ in range(DECIMATION):
             mujoco.mj_step(m, d)
         f = min(f + 1, ce - 1)
