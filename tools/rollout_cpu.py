@@ -3,7 +3,7 @@ policy code (JAX on the CPU) acts, under the evaluation protocol (no randomizati
 
     python tools/rollout_cpu.py <ckpt_*.npz> --clip dance1_subject2 --start 60 --seconds 12 --out rollout.npz
 
-Writes the robot's qpos and the reference frame at every 50 Hz control step (tools/render_gif.py renders them). The
+Writes the robot's qpos, joint velocities, peak joint torques and the reference frame at every 50 Hz control step (tools/render_gif.py renders them). The
 training simulator is MuJoCo Warp; MuJoCo's C simulator integrates the same model, so this is a sim-to-sim check too.
 """
 
@@ -77,20 +77,24 @@ def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1", masked=0)
     a_prev = jnp.asarray((q - default_q) / alpha, jnp.float32) if late else jnp.zeros(J)  # as Sim.reset_masked
     o, _ = observe(d.qpos, d.qvel, a_prev, jnp.int32(f))
     hist = jnp.broadcast_to(o, (a["hist"], o.shape[-1]))
-    out = {"qpos": [d.qpos.copy()], "f": [f], "alive": [True]}
+    out = {"qpos": [d.qpos.copy()], "f": [f], "alive": [True], "qd": [d.qvel[dadr].copy()], "torque": [np.zeros(J)]}
     alive = True
     for t in range(int(round(seconds * 50))):
         if t > 0:
             hist = jnp.concatenate((hist[1:], o[None]), 0)
         a_t = policy(hist, jnp.int32(f))
         d.ctrl[act] = default_q + alpha * np.asarray(a_prev if late else a_t, np.float64)
+        peak = np.zeros(J)
         for _ in range(DECIMATION):
             mujoco.mj_step(m, d)
+            peak = np.maximum(peak, np.abs(d.actuator_force[act]))
         f = min(f + 1, ce - 1)
         a_prev = a_t
         o, term = observe(d.qpos, d.qvel, a_prev, jnp.int32(f))
         alive = alive and not bool(term)
         out["qpos"].append(d.qpos.copy())
+        out["qd"].append(d.qvel[dadr].copy())
+        out["torque"].append(peak)  # largest |actuator torque| of the step's physics substeps, per joint
         out["f"].append(f)
         out["alive"].append(alive)
     return {k: np.asarray(v) for k, v in out.items()}
