@@ -2,8 +2,10 @@
 
 The G1-retargeted LAFAN1 clips (30 fps CSV) are resampled to the 50 Hz control rate. Root and joint velocities come from
 finite differences, the tracked bodies from forward kinematics. Clips are cut into 1-second reset bins, and the policy's
-goal is a window of future reference frames. The library is a pytree of device arrays: it is passed into jitted functions
-as an argument and never closed over as a constant.
+goal is a window of future reference frames (with --goal_mask_share, in a share of the episodes only a command as a
+joystick gives it, the root's planar velocity and yaw rate smoothed over CMD_WINDOW, plus a flag: XiLayout.masked in
+sim.py). The library is a pytree of device arrays: it is passed into jitted functions as an argument and never closed
+over as a constant.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from .rot import mat_to_6d, mm3, mv3, tr3, yaw_mat
 CONTROL_DT = 0.02
 BIN_FRAMES = 50
 GOAL_Q_OFFSET = 15  # index of q(f+1) in the goal vector (first future frame: dp 3, rot 6, v 3, w 3, then q)
+CMD_WINDOW = 51  # frames averaged into the command (1 s, about one gait cycle): the reference's gait phase must not show
 
 
 def load_lafan1_csv(path: str):
@@ -85,14 +88,24 @@ def _gradient(x, dt):
     return g
 
 
+def _smooth(x):
+    """Centered moving average over CMD_WINDOW frames along axis 0; at the ends, over the frames that exist."""
+    n, h = len(x), CMD_WINDOW // 2
+    c = np.concatenate((np.zeros_like(x[:1]), np.cumsum(x, 0)))
+    lo, hi = np.maximum(np.arange(n) - h, 0), np.minimum(np.arange(n) + h + 1, n)
+    return (c[hi] - c[lo]) / (hi - lo).reshape((-1,) + (1,) * (x.ndim - 1))
+
+
 @partial(jax.tree_util.register_dataclass,
          data_fields=["root_p", "root_R", "root_v", "root_w", "q", "qd", "body_p", "body_R", "body_v", "body_w", "root_v_local",
-                      "root_w_local", "clip_id", "clip_start", "clip_end", "bin_clip", "bin_start", "frame_bin", "ref_contact"],
+                      "root_w_local", "cmd_yaw_R", "cmd_w", "cmd_v", "clip_id", "clip_start", "clip_end", "bin_clip", "bin_start",
+                      "frame_bin", "ref_contact"],
          meta_fields=["names", "num_frames", "num_bins", "num_joints"])  # fmt: skip
 @dataclasses.dataclass
 class Motion:
     """All clips concatenated along one frame axis. Per frame: root and joint state, tracked-body poses and velocities, the
-    clip it belongs to and its reset bin, and the reference foot contacts."""
+    command (smoothed heading as a yaw rotation, its yaw rate, the smoothed planar velocity in its frame), the clip it
+    belongs to and its reset bin, and the reference foot contacts."""
 
     root_p: jax.Array
     root_R: jax.Array
@@ -106,6 +119,9 @@ class Motion:
     body_w: jax.Array
     root_v_local: jax.Array
     root_w_local: jax.Array
+    cmd_yaw_R: jax.Array
+    cmd_w: jax.Array
+    cmd_v: jax.Array
     clip_id: jax.Array
     clip_start: jax.Array
     clip_end: jax.Array
@@ -136,6 +152,11 @@ class Motion:
         feats = jnp.concatenate((dp, rot, self.root_v_local[fut], self.root_w_local[fut], self.q[fut], self.qd[fut] * 0.1), -1)
         return feats.reshape(f.shape + (-1,))
 
+    def goal_cmd(self, f, K: int):
+        """What a masked goal keeps: the command's planar velocity and yaw rate at the K future frames (..., K, 3)."""
+        fut = self.future_frames(f, K)
+        return jnp.concatenate((self.cmd_v[fut], self.cmd_w[fut][..., None]), -1)
+
     def ref_state(self, f):
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]
 
@@ -145,7 +166,7 @@ def load_motion(motion_dir: str, kin, feet: list[int], margin: float = 0.015, vm
     files = sorted(glob.glob(os.path.join(motion_dir, "*.csv")))
     assert files, f"no clips in {motion_dir}: run tools/download_data.sh first"
     names = tuple(os.path.splitext(os.path.basename(f))[0] for f in files)
-    ps, Rs, vs, ws, js, jds, lens = [], [], [], [], [], [], []
+    ps, Rs, vs, ws, js, jds, lens, cRs, cws, cvs = [], [], [], [], [], [], [], [], [], []
     for f in files:
         p, quat, j, fps = load_lafan1_csv(f)
         assert j.shape[1] == len(kin.q_lo), f"{f}: {j.shape[1]} joint columns, the robot has {len(kin.q_lo)} joints"
@@ -164,7 +185,13 @@ def load_motion(motion_dir: str, kin, feet: list[int], margin: float = 0.015, vm
         w[1:-1] = _so3_log_np(R[2:] @ np.swapaxes(R[:-2], -1, -2)) / np.float32(2 * CONTROL_DT)
         w[0] = _so3_log_np(R[1] @ R[0].T) / np.float32(CONTROL_DT)
         w[-1] = _so3_log_np(R[-1] @ R[-2].T) / np.float32(CONTROL_DT)
-        ps.append(p), Rs.append(R), vs.append(_gradient(p, CONTROL_DT)), ws.append(w), js.append(j), jds.append(_gradient(j, CONTROL_DT))
+        v = _gradient(p, CONTROL_DT)
+        ps.append(p), Rs.append(R), vs.append(v), ws.append(w), js.append(j), jds.append(_gradient(j, CONTROL_DT))
+        head = _smooth(np.unwrap(np.arctan2(R[:, 1, 0], R[:, 0, 0]).astype(np.float64)))
+        c, s, o, vm = np.cos(head), np.sin(head), np.zeros(n), _smooth(v[:, :2].astype(np.float64))
+        cRs.append(np.stack((c, -s, o, s, c, o, o, o, o + 1), -1).reshape(n, 3, 3))
+        cws.append(_gradient(head, CONTROL_DT))
+        cvs.append(np.stack((c * vm[:, 0] + s * vm[:, 1], c * vm[:, 1] - s * vm[:, 0]), -1))
         lens.append(n)
     lens = np.asarray(lens)
     clip_start = np.concatenate(([0], np.cumsum(lens[:-1]))).astype(np.int32)
@@ -195,6 +222,7 @@ def load_motion(motion_dir: str, kin, feet: list[int], margin: float = 0.015, vm
     ref_contact = ((z < floor + margin) & (vh < vmax)).astype(np.float32)
     return Motion(root_p=root_p, root_R=root_R, root_v=root_v, root_w=root_w, q=q, qd=qd, body_p=body_p, body_R=body_R,
                   body_v=body_v, body_w=body_w, root_v_local=mv3(Rt, root_v), root_w_local=mv3(Rt, root_w),
+                  cmd_yaw_R=cat(cRs), cmd_w=cat(cws), cmd_v=cat(cvs),
                   clip_id=jnp.asarray(clip_id), clip_start=jnp.asarray(clip_start), clip_end=jnp.asarray(clip_end),
                   bin_clip=jnp.asarray(bin_clip, jnp.int32), bin_start=jnp.asarray(bin_start, jnp.int32),
                   frame_bin=jnp.asarray(frame_bin), ref_contact=jnp.asarray(ref_contact), names=names,

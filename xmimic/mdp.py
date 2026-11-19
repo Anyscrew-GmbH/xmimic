@@ -57,8 +57,8 @@ class MDP:
     """Observation, reward (BeyondMimic's tracking terms plus InstantTrack's contact term), hard and soft termination, and
     the critic's privileged features."""
 
-    def __init__(self, kin, default_q, feet: list[int], xi_dim: int, contact_z: float = CONTACT_Z):
-        self.kin, self.contact_z = kin, contact_z
+    def __init__(self, kin, default_q, feet: list[int], xi_dim: int, contact_z: float = CONTACT_Z, mask=None):
+        self.kin, self.contact_z, self.mask = kin, contact_z, mask  # mask: XiLayout.mask
         J = len(default_q)
         self.J, self.xi_dim = J, xi_dim
         self.default_q = np.asarray(default_q, np.float32)
@@ -71,12 +71,19 @@ class MDP:
         self.obs_noise = np.asarray(np.concatenate((np.full(J, n[0]), np.full(J, n[1]), np.full(3, n[2]), np.full(3, n[3]),
                                                      np.full(J, n[4]), np.full(6, n[5]))), np.float32)  # fmt: skip
 
+    def ref_R(self, motion, xi, f):
+        """The reference root rotation the observation relates to: the reference's, or in a goal-masked episode the command's
+        heading."""
+        if self.mask is None:
+            return motion.root_R[f]
+        return jnp.where(xi[..., self.mask, None, None] > 0.5, motion.cmd_yaw_R[f], motion.root_R[f])
+
     def obs(self, motion, S, a_prev, xi, f):
         """Noise-free observation: q - q0 - offset, qd, body angular velocity, projected gravity, a_prev, ref orientation (6D)."""
         p, R, v, w, q, qd = S
         Rt = tr3(R)
         dq0 = xi[..., 1 : 1 + self.J]
-        rel = mat_to_6d(mm3(Rt, motion.root_R[f]))
+        rel = mat_to_6d(mm3(Rt, self.ref_R(motion, xi, f)))
         return jnp.concatenate((q - self.default_q - dq0, qd, mv3(Rt, w), -R[..., 2, :], a_prev, rel), -1)
 
     def add_noise(self, key, o):

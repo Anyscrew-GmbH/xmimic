@@ -325,6 +325,7 @@ class ProberProcess:
 def run(cfg: Config):
     layout = cfg.layout
     assert layout != "1GPU", "the 1GPU layout runs in single_gpu.py"
+    assert cfg.goal_mask_share == 0, "--goal_mask_share needs the single-GPU layout (--layout 1GPU)"
     probing = cfg.eprobe_share > 0
     prober = None
     if probing and layout in ("FP1", "AL", "AWL"):  # start the prober process first: it builds and compiles while we do

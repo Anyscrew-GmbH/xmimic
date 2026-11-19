@@ -149,10 +149,11 @@ class FastXMimic(XMimic):
         F, F1 = F_all[:H], F_all[1:]
         G_all = motion.goal(F_all, K)
         G, g_H = G_all[:H], G_all[H]
-        Z = jnp.tanh(self._mlp(pi["enc"], nets.rn_apply(pi_b["goal_norm"], G), jax.nn.elu)[0])  # nets.pi_encode
+        Gp = self.layout.masked(G, motion, F, xi)  # what the policy sees; the critic keeps G_all
+        Z = jnp.tanh(self._mlp(pi["enc"], nets.rn_apply(pi_b["goal_norm"], Gp), jax.nn.elu)[0])  # nets.pi_encode
         off, q0, alpha = self.ref
-        GR = (G[..., off : off + J] - q0) / alpha  # ref-skip term of pi_apply
-        RR = motion.root_R[F1]  # reference root rotation in mdp.obs at frame f+1
+        GR = (Gp[..., off : off + J] - q0) / alpha  # ref-skip term of pi_apply
+        RR = mdp.ref_R(motion, xi, F1)  # reference root rotation in mdp.obs at frame f+1
         NZ = self._noise(keys, B)  # mdp.add_noise for every step
         dq0 = xi[..., 1 : 1 + J]
         hn0 = nets.rn_apply(pi_b["obs_norm"], o_hist0).reshape(B, -1)  # normalized history, oldest first

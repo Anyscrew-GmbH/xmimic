@@ -65,6 +65,8 @@ class Config:
     seed: int = 0
     motion_dir: str = "data/lafan1_g1"
     robot_dir: str = ""  # directory with the robot's scene.xml and meta.json ("": the bundled G1, assets/g1)
+    goal_mask_share: float = 0.0  # share of episodes whose policy sees only a command as a joystick gives it: the root's
+    #                               smoothed planar velocity and yaw rate (motion.py; 0: off; 1GPU layout only)
     log_dir: str = "runs/xmimic"
     max_minutes: float = 0.0  # stop after this much training time (0: run all iterations)
     # ---- layout and learner

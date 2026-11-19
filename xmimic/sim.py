@@ -36,7 +36,7 @@ class XiLayout:
     """Layout of the sim context xi = (friction 1, joint offsets J, CoM offset 3, then J factors per randomized actuator
     constant) and its normalization (center and half-range, as blinkmimic.dr.XiLayout)."""
 
-    def __init__(self, meta: dict):
+    def __init__(self, meta: dict, goal_mask_share: float = 0.0):
         J = len(meta["joint_names"])
         lo, hi = meta["dr"]["friction_range"]
         self.J = J
@@ -53,6 +53,12 @@ class XiLayout:
             self.dim += J
             self.center = np.append(self.center, np.full(J, (lo + hi) / 2, np.float32))
             self.scale = np.append(self.scale, np.full(J, max((hi - lo) / 2, 1e-6), np.float32))
+        self.mask_p, self.mask = goal_mask_share, None
+        if self.mask_p > 0:
+            self.mask = self.dim  # xi[..., mask] = 1: this episode's policy sees only the command, not the reference
+            self.dim += 1
+            self.center, self.scale = np.append(self.center, np.float32(0.5)), np.append(self.scale, np.float32(0.5))
+            self.goal_neutral = np.concatenate(([0.0] * 3, [1, 0, 0, 1, 0, 0], [0.0] * 6, meta["default_joint_pos"], [0.0] * J)).astype(np.float32)
         self.delay_p, self.delay = meta["dr"].get("action_delay", 0.0), None
         if self.delay_p > 0:
             self.delay = self.dim  # xi[..., delay] = 1: this episode's actions act one control step late
@@ -62,6 +68,16 @@ class XiLayout:
     def applied(self, a, a_prev, xi):
         """The action that moves the joint targets in a step: the policy's, or the previous one in a delayed episode."""
         return a if self.delay is None else jnp.where(xi[..., self.delay, None] > 0.5, a_prev, a)
+
+    def masked(self, g, motion, f, xi):
+        """The goal the policy sees at the frames f: the reference goal g, or in a masked episode only the command (planar
+        velocity and yaw rate as v x, v y, w z, every other entry neutral), then the flag. Without goal masking: g itself."""
+        if self.mask is None:
+            return g
+        m = jnp.broadcast_to(xi[..., self.mask, None], g.shape[:-1] + (1,))
+        cmd = motion.goal_cmd(f, g.shape[-1] // self.goal_neutral.size)
+        gc = jnp.broadcast_to(self.goal_neutral, cmd.shape[:-1] + self.goal_neutral.shape).at[..., np.asarray((9, 10, 14))].set(cmd)
+        return jnp.concatenate((jnp.where(m > 0.5, gc.reshape(g.shape), g), m), -1)
 
     def normalize(self, xi):
         return (xi - self.center) / self.scale
@@ -74,7 +90,7 @@ class Sim:
     and randomizes; ``eval_mode`` resets exactly onto the reference, without randomization and without timeouts."""
 
     def __init__(self, mj_model, meta: dict, num_envs: int, mdp, eval_mode: bool = False, gamma: float = 0.99,
-                 max_episode_steps: int = 500, fail_reset: float = 0.0, device=None):  # fmt: skip
+                 max_episode_steps: int = 500, fail_reset: float = 0.0, goal_mask_share: float = 0.0, device=None):  # fmt: skip
         from warp import JaxCallableGraphMode
 
         self.m, self.meta, self.N, self.mdp = mj_model, meta, num_envs, mdp
@@ -82,7 +98,7 @@ class Sim:
         self.gamma, self.fail_reset = gamma, fail_reset
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         self.J = len(meta["joint_names"])
-        self.layout = XiLayout(meta)
+        self.layout = XiLayout(meta, goal_mask_share)
         self.qadr = np.asarray(meta["qpos_adr"])
         self.dadr = np.asarray(meta["dof_adr"])
         self.act = np.asarray(meta["actuator_of_joint"])
@@ -214,6 +230,9 @@ class Sim:
             if L.delay is not None:
                 late = jax.random.bernoulli(jax.random.fold_in(ks[7], 1), L.delay_p, (N,)).astype(xi.dtype)
                 xi = xi.at[:, L.delay].set(jnp.where(d, late, xi[:, L.delay]))
+            if L.mask is not None:
+                masked = jax.random.bernoulli(jax.random.fold_in(ks[7], 2), L.mask_p, (N,)).astype(xi.dtype)
+                xi = xi.at[:, L.mask].set(jnp.where(d, masked, xi[:, L.mask]))
         a0 = 0.0
         if self.layout.delay is not None:  # a delayed episode's first step applies a_prev: the action that holds the reset pose
             hold = (q - self.default_q - xi[:, self.layout.joint_offset]) / self.alpha

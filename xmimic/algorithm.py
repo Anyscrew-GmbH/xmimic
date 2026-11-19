@@ -95,14 +95,14 @@ class XMimic:
         self.J = J = len(meta["joint_names"])
         self.kin = Kinematics(meta)
         feet = feet_of(meta)
-        self.sim = Sim(self.mj_model, meta, c.num_envs, None, gamma=c.gamma, fail_reset=c.fail_reset)
+        self.sim = Sim(self.mj_model, meta, c.num_envs, None, gamma=c.gamma, fail_reset=c.fail_reset, goal_mask_share=c.goal_mask_share)
         self.layout = self.sim.layout
-        self.mdp = MDP(self.kin, meta["default_joint_pos"], feet, self.layout.dim, meta["contact_z"])
+        self.mdp = MDP(self.kin, meta["default_joint_pos"], feet, self.layout.dim, meta["contact_z"], self.layout.mask)
         self.sim.mdp = self.mdp
         self.motion = load_motion(c.motion_dir, self.kin, feet)
-        self.goal_dim = self.motion.goal_dim(c.goal_frames)
+        self.goal_dim = self.motion.goal_dim(c.goal_frames) + (self.layout.mask is not None)  # the policy's goal
         self.obs_dim = obs_dim(J)
-        self.critic_in = inv_dim(J) + self.mdp.critic_extra + self.goal_dim
+        self.critic_in = inv_dim(J) + self.mdp.critic_extra + self.motion.goal_dim(c.goal_frames)
         self.wm_in = inv_dim(J) + J + self.layout.dim
         self.wm_out = 12 + 2 * J
         self.ref = (GOAL_Q_OFFSET, np.asarray(meta["default_joint_pos"], np.float32), np.asarray(meta["action_scale"], np.float32))
@@ -113,7 +113,7 @@ class XMimic:
         self.probes = c.eprobe_share > 0 if probes is None else probes
         self.make_probe_tiles()
         if self.probes:
-            self.penv = Sim(self.mj_model, meta, self.P, self.mdp, eval_mode=True, gamma=c.gamma)
+            self.penv = Sim(self.mj_model, meta, self.P, self.mdp, eval_mode=True, gamma=c.gamma, goal_mask_share=c.goal_mask_share)
 
     def make_probe_tiles(self):
         """Probe worlds: one per tile of ``eprobe_tile`` frames of every clip (ep_tile: each tile's first frame), and the
@@ -174,7 +174,7 @@ class XMimic:
         fresh = env["ep_step"] == 0
         oh = carry["obs_hist"]
         oh = jnp.where(fresh[:, None, None], jnp.broadcast_to(o[:, None], oh.shape), jnp.concatenate((oh[:, 1:], o[:, None]), 1))
-        g = motion.goal(env["f"], c.goal_frames)
+        g = self.layout.masked(motion.goal(env["f"], c.goal_frames), motion, env["f"], env["xi"])
         pi_b = {"obs_norm": nets.rn_update(carry["pi_b"]["obs_norm"], o), "goal_norm": nets.rn_update(carry["pi_b"]["goal_norm"], g)}
         a = nets.pi_apply(carry["pi"], pi_b, oh, g, self.ref)
         a = jnp.clip(a + c.action_noise * jax.random.normal(k_act, a.shape), -20, 20)
@@ -251,7 +251,8 @@ class XMimic:
         xi_n = self.layout.normalize(xi)
         F = f0[None] + jnp.arange(H, dtype=f0.dtype)[:, None]  # reference frame of each imagined step (H, B)
         G = motion.goal(F, K)
-        Z = nets.pi_encode(pi, pi_b, G)  # the goal encodings of all steps in one batch (InstantTrack --batch_goal_enc)
+        Gp = self.layout.masked(G, motion, F, xi)  # what the policy sees; the critic keeps G
+        Z = nets.pi_encode(pi, pi_b, Gp)  # the goal encodings of all steps in one batch (InstantTrack --batch_goal_enc)
 
         def step(carry, x):
             S, oh, a_prev, f = carry
@@ -266,7 +267,7 @@ class XMimic:
             step = jax.checkpoint(step, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         elif c.imag_remat == "full":
             step = jax.checkpoint(step)
-        (S_H, _, _, f_H), (S_all, A, Ap) = jax.lax.scan(step, (S0, o_hist0, a_prev0, f0), (Z, G, keys), unroll=True)
+        (S_H, _, _, f_H), (S_all, A, Ap) = jax.lax.scan(step, (S0, o_hist0, a_prev0, f0), (Z, Gp, keys), unroll=True)
         F1 = F + 1
         flat = lambda x: x.reshape((-1,) + x.shape[2:])  # noqa: E731
         Sf = tuple(flat(x) for x in S_all)
@@ -424,7 +425,7 @@ class XMimic:
 
         def run(ep):
             F = jnp.minimum(ep["pst"]["f"][None] + jnp.arange(K, dtype=jnp.int32)[:, None], ep["fcap"][None])  # (K, P)
-            G = motion.goal(F, c.goal_frames)
+            G = self.layout.masked(motion.goal(F, c.goal_frames), motion, F, ep["pst"]["xi"])
             Z = nets.pi_encode(snap_p, snap_b, G)
 
             def step(j, s):

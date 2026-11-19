@@ -29,7 +29,7 @@ from xmimic.rot import mat_to_quat, mv3, quat_to_mat, tr3  # noqa: E402
 from xmimic.sim import DECIMATION, XiLayout  # noqa: E402
 
 
-def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1"):
+def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1", masked=0):
     """{qpos (T+1, nq), f (T+1,) reference frames, alive (T+1,)} of one episode from frame start_s * 50 of ``clip``."""
     jax.config.update("jax_platforms", "cpu")
     params, bufs, meta_ck = load_ckpt(ckpt)
@@ -39,8 +39,9 @@ def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1"):
     kin = Kinematics(meta)
     feet = feet_of(meta)
     motion = load_motion(motion_dir, kin, feet)
-    layout = XiLayout(meta)
-    mdp = MDP(kin, meta["default_joint_pos"], feet, layout.dim, meta["contact_z"])
+    layout = XiLayout(meta, a.get("goal_mask_share", 0.0))
+    assert not masked or layout.mask is not None, "--masked needs a checkpoint trained with goal_mask_share > 0"
+    mdp = MDP(kin, meta["default_joint_pos"], feet, layout.dim, meta["contact_z"], layout.mask)
     ref = (GOAL_Q_OFFSET, jnp.asarray(meta["default_joint_pos"], jnp.float32), jnp.asarray(meta["action_scale"], jnp.float32))
     m.geom_friction[np.asarray(meta["robot_geom_ids"]), 0] = 1.0  # evaluation friction
     d = mujoco.MjData(m)
@@ -48,6 +49,8 @@ def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1"):
     fq, fd = meta["free_qpos_adr"], meta["free_dof_adr"]
     default_q, alpha = np.asarray(meta["default_joint_pos"], np.float64), np.asarray(meta["action_scale"], np.float64)
     xi = jnp.zeros((1, layout.dim))  # no randomization: zero joint offsets
+    if masked:
+        xi = xi.at[:, layout.mask].set(1.0)
     late = layout.delay_p >= 0.5  # the evaluation's action delay (Sim.init)
 
     def state(qpos, qvel):  # as Sim.state, for one world
@@ -61,7 +64,7 @@ def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1"):
 
     @jax.jit
     def policy(hist, f):
-        return nets.pi_apply(params, bufs, hist[None], motion.goal(f[None], a["goal_frames"]), ref)[0]
+        return nets.pi_apply(params, bufs, hist[None], layout.masked(motion.goal(f[None], a["goal_frames"]), motion, f[None], xi), ref)[0]
 
     c = motion.names.index(clip)
     cs, ce = int(motion.clip_start[c]), int(motion.clip_end[c])
@@ -101,8 +104,9 @@ def main():
     ap.add_argument("--seconds", type=float, default=12.0)
     ap.add_argument("--motion_dir", default="data/lafan1_g1")
     ap.add_argument("--out", default="rollout.npz")
+    ap.add_argument("--masked", type=int, default=0, help="1: the policy's goal is masked (needs goal_mask_share > 0)")
     args = ap.parse_args()
-    r = rollout(args.ckpt, args.clip, args.start, args.seconds, args.motion_dir)
+    r = rollout(args.ckpt, args.clip, args.start, args.seconds, args.motion_dir, args.masked)
     np.savez(args.out, **r, clip=args.clip)
     print(f"{args.clip} from {args.start:.1f} s: {len(r['f']) - 1} steps, alive to the end: {bool(r['alive'][-1])} -> {args.out}")
 

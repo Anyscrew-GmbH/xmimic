@@ -49,10 +49,13 @@ def main(argv=None):
     ap.add_argument("--chunk", type=int, default=500, help="control steps per compiled program")
     ap.add_argument("--motion_dir", default=None, help="default: the run's own")
     ap.add_argument("--group", type=int, default=0, help="checkpoints per batch (0: all at once)")
+    ap.add_argument("--masked", type=int, default=0, help="1: every world's policy goal is masked (needs goal_mask_share > 0)")
     args = ap.parse_args(argv)
     files = sorted(glob.glob(os.path.join(args.run_dir, "ckpt_*.npz")))[:: args.every]
     assert files, args.run_dir
     cfg = json.loads(str(np.load(files[0])["meta"]))["args"]
+    share = cfg.get("goal_mask_share", 0.0)
+    assert not args.masked or share > 0, "--masked needs checkpoints trained with goal_mask_share > 0"
     mj, meta = load_model(cfg.get("robot_dir"))
     kin = Kinematics(meta)
     feet = feet_of(meta)
@@ -69,11 +72,13 @@ def main(argv=None):
         N = M * R * C  # world n: checkpoint n // (R*C), replica (n // C) % R, clip n % C
         params = jax.tree.map(lambda *x: jnp.stack(x), *[c[0] for c in cks])
         bufs = jax.tree.map(lambda *x: jnp.stack(x), *[c[1] for c in cks])
-        sim = Sim(mj, meta, N, None, eval_mode=True)
-        mdp = MDP(kin, meta["default_joint_pos"], feet, sim.layout.dim, meta["contact_z"])
+        sim = Sim(mj, meta, N, None, eval_mode=True, goal_mask_share=share)
+        mdp = MDP(kin, meta["default_joint_pos"], feet, sim.layout.dim, meta["contact_z"], sim.layout.mask)
         sim.mdp = mdp
         clip_of = jnp.arange(N) % C
         model_b, st = sim.init(jax.random.PRNGKey(0), motion)
+        if args.masked:
+            st = {**st, "xi": st["xi"].at[:, sim.layout.mask].set(1.0)}
         st = sim.reset_masked(motion, st, jnp.ones(N, bool), jax.random.PRNGKey(1), frames=motion.clip_start[clip_of])
         clip_end = motion.clip_end[clip_of]
         o = sim.observe(motion, st)
@@ -88,7 +93,7 @@ def main(argv=None):
                 st = cr["st"]
                 o = sim.observe(motion, st)
                 h = jnp.where(cr["first"], cr["hist"], jnp.concatenate((cr["hist"][:, 1:], o[:, None]), 1))
-                g = motion.goal(st["f"], K)
+                g = sim.layout.masked(motion.goal(st["f"], K), motion, st["f"], st["xi"])
                 a = jax.vmap(act)(params, bufs, h.reshape(M, R * C, *h.shape[1:]), g.reshape(M, R * C, -1)).reshape(N, -1)
                 alive = ~st["done_eval"]
                 st, out = sim.step_core(model_b, motion, st, a)
@@ -117,7 +122,7 @@ def main(argv=None):
             r = rows[-1]
             print(f"[eval] it {r['iteration']} ({r['train_wall_h'] * 60:.2f} min): return {r['norm_return']:.4f}, failed {r['n_failed']:.2f}/{C}", flush=True)
         print(f"group of {M} checkpoints x {R} reps x {C} clips = {N} worlds: {n_steps} steps in {time.time() - t0:.0f} s", flush=True)
-    out = os.path.join(args.run_dir, f"eval_jax_r{args.reps}.csv")
+    out = os.path.join(args.run_dir, f"eval_jax_r{args.reps}{'_masked' * bool(args.masked)}.csv")
     with open(out, "w") as fh:
         fh.write("iteration,train_wall_h,norm_return,norm_return_framew,n_failed,failed\n")
         for r in sorted(rows, key=lambda r: r["iteration"]):

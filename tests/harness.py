@@ -56,12 +56,12 @@ def build(cls, cfg: Config, clips=CLIPS):
     xm.J = J = len(meta["joint_names"])
     xm.kin = Kinematics(meta)
     feet = feet_of(meta)
-    xm.layout = XiLayout(meta)
-    xm.mdp = MDP(xm.kin, meta["default_joint_pos"], feet, xm.layout.dim)
+    xm.layout = XiLayout(meta, c.goal_mask_share)
+    xm.mdp = MDP(xm.kin, meta["default_joint_pos"], feet, xm.layout.dim, mask=xm.layout.mask)
     xm.motion = motion_for(xm.kin, feet, clips)
-    xm.goal_dim = xm.motion.goal_dim(c.goal_frames)
+    xm.goal_dim = xm.motion.goal_dim(c.goal_frames) + (xm.layout.mask is not None)
     xm.obs_dim = obs_dim(J)
-    xm.critic_in = inv_dim(J) + xm.mdp.critic_extra + xm.goal_dim
+    xm.critic_in = inv_dim(J) + xm.mdp.critic_extra + xm.motion.goal_dim(c.goal_frames)
     xm.wm_in = inv_dim(J) + J + xm.layout.dim
     xm.wm_out = 12 + 2 * J
     xm.ref = (GOAL_Q_OFFSET, np.asarray(meta["default_joint_pos"], np.float32), np.asarray(meta["action_scale"], np.float32))
@@ -83,7 +83,8 @@ def _rand_xi(key, xm, shape):
     com = jax.random.uniform(kc, shape + (3,), minval=cr[:, 0], maxval=cr[:, 1])
     fac = [jax.random.uniform(jax.random.fold_in(key, i), shape + (xm.J,), minval=lo, maxval=hi) for i, (_, lo, hi) in enumerate(L.factors.values())]
     late = [jax.random.bernoulli(jax.random.fold_in(key, 9), L.delay_p, shape + (1,)).astype(jnp.float32)] * (L.delay is not None)
-    return jnp.concatenate((fr, off, com, *fac, *late), -1)
+    mask = [jax.random.bernoulli(jax.random.fold_in(key, 10), L.mask_p, shape + (1,)).astype(jnp.float32)] * (L.mask is not None)
+    return jnp.concatenate((fr, off, com, *fac, *mask, *late), -1)
 
 
 def _noisy_state(key, S, scale=1.0):
@@ -132,7 +133,7 @@ def make_state(xm, seed=0):
         S1f = unflatten_state(buf["s1"].reshape(T * N, -1))
         ff, xif = buf["f"].reshape(-1), buf["xi"].reshape(T * N, -1)
         o = xm.mdp.obs(mo, Sf, buf["a_prev"].reshape(T * N, -1), xif, ff)
-        pi_b = {"obs_norm": nets.rn_update(pi_b["obs_norm"], o), "goal_norm": nets.rn_update(pi_b["goal_norm"], mo.goal(ff, c.goal_frames))}
+        pi_b = {"obs_norm": nets.rn_update(pi_b["obs_norm"], o), "goal_norm": nets.rn_update(pi_b["goal_norm"], xm.layout.masked(mo.goal(ff, c.goal_frames), mo, ff, xif))}
         wm_b = {"in_norm": nets.rn_update(wm_b["in_norm"], nets.wm_inputs(Sf, buf["a"].reshape(T * N, -1), xm.layout.normalize(xif))),
                 "out_norm": nets.rn_update(wm_b["out_norm"], nets.wm_targets(Sf, S1f, CONTROL_DT)),
                 "inc_norm": nets.rn_update(wm_b["inc_norm"], nets.increments(Sf, S1f))}  # fmt: skip
