@@ -48,6 +48,7 @@ def main(argv=None):
     ap.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
     ap.add_argument("--chunk", type=int, default=500, help="control steps per compiled program")
     ap.add_argument("--motion_dir", default=None, help="default: the run's own")
+    ap.add_argument("--robot_dir", default=None, help="default: the run's own")
     ap.add_argument("--group", type=int, default=0, help="checkpoints per batch (0: all at once)")
     ap.add_argument("--masked", type=int, default=0, help="1: every world's policy goal is masked (needs goal_mask_share > 0)")
     args = ap.parse_args(argv)
@@ -56,7 +57,7 @@ def main(argv=None):
     cfg = json.loads(str(np.load(files[0])["meta"]))["args"]
     share = cfg.get("goal_mask_share", 0.0)
     assert not args.masked or share > 0, "--masked needs checkpoints trained with goal_mask_share > 0"
-    mj, meta = load_model(cfg.get("robot_dir"))
+    mj, meta = load_model(args.robot_dir or cfg.get("robot_dir"))
     kin = Kinematics(meta)
     feet = feet_of(meta)
     motion = load_motion(args.motion_dir or cfg["motion_dir"], kin, feet)

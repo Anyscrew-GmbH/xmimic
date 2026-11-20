@@ -29,12 +29,12 @@ from xmimic.rot import mat_to_quat, mv3, quat_to_mat, tr3  # noqa: E402
 from xmimic.sim import DECIMATION, XiLayout  # noqa: E402
 
 
-def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1", masked=0):
+def rollout(ckpt, clip, start_s, seconds, motion_dir="data/lafan1_g1", masked=0, robot_dir=None):
     """{qpos (T+1, nq), f (T+1,) reference frames, alive (T+1,)} of one episode from frame start_s * 50 of ``clip``."""
     jax.config.update("jax_platforms", "cpu")
     params, bufs, meta_ck = load_ckpt(ckpt)
     a = meta_ck["args"]
-    m, meta = load_model(a.get("robot_dir"))
+    m, meta = load_model(robot_dir or a.get("robot_dir"))
     J = len(meta["joint_names"])
     kin = Kinematics(meta)
     feet = feet_of(meta)
@@ -107,10 +107,11 @@ def main():
     ap.add_argument("--start", type=float, default=60.0, help="start time in the clip (s)")
     ap.add_argument("--seconds", type=float, default=12.0)
     ap.add_argument("--motion_dir", default="data/lafan1_g1")
+    ap.add_argument("--robot_dir", default=None, help="default: the checkpoint's own")
     ap.add_argument("--out", default="rollout.npz")
     ap.add_argument("--masked", type=int, default=0, help="1: the policy's goal is masked (needs goal_mask_share > 0)")
     args = ap.parse_args()
-    r = rollout(args.ckpt, args.clip, args.start, args.seconds, args.motion_dir, args.masked)
+    r = rollout(args.ckpt, args.clip, args.start, args.seconds, args.motion_dir, args.masked, args.robot_dir)
     np.savez(args.out, **r, clip=args.clip)
     print(f"{args.clip} from {args.start:.1f} s: {len(r['f']) - 1} steps, alive to the end: {bool(r['alive'][-1])} -> {args.out}")
 
