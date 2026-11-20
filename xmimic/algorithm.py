@@ -77,6 +77,9 @@ class Mirror:
         xi = xi.at[..., L.joint_offset].set(self.joints(xi[..., L.joint_offset]))
         for sl, _, _ in L.factors.values():  # per-joint factors swap sides, without a sign
             xi = xi.at[..., sl].set(xi[..., sl][..., self.perm])
+        for bodies, sl, _, _ in L.payload:  # (mass, CoM) per body: a pair swaps, the lateral CoM component flips
+            p = xi[..., sl].reshape(xi.shape[:-1] + (len(bodies), 4))[..., ::-1, :] * np.asarray([1.0, 1.0, -1.0, 1.0], np.float32)
+            xi = xi.at[..., sl].set(p.reshape(xi.shape[:-1] + (-1,)))
         return xi.at[..., L.com.start + 1].set(-xi[..., L.com.start + 1])
 
 

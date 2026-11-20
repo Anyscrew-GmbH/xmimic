@@ -84,7 +84,8 @@ def _rand_xi(key, xm, shape):
     fac = [jax.random.uniform(jax.random.fold_in(key, i), shape + (xm.J,), minval=lo, maxval=hi) for i, (_, lo, hi) in enumerate(L.factors.values())]
     late = [jax.random.bernoulli(jax.random.fold_in(key, 9), L.delay_p, shape + (1,)).astype(jnp.float32)] * (L.delay is not None)
     mask = [jax.random.bernoulli(jax.random.fold_in(key, 10), L.mask_p, shape + (1,)).astype(jnp.float32)] * (L.mask is not None)
-    return jnp.concatenate((fr, off, com, *fac, *mask, *late), -1)
+    pay = [jax.random.uniform(jax.random.fold_in(key, 20 + i), shape + (lo.size,), minval=lo.ravel(), maxval=hi.ravel()) for i, (_, _, lo, hi) in enumerate(L.payload)]
+    return jnp.concatenate((fr, off, com, *fac, *pay, *mask, *late), -1)
 
 
 def _noisy_state(key, S, scale=1.0):

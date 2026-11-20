@@ -10,6 +10,11 @@ Optional, for a robot whose drives were identified (off for the G1): meta["dr"][
 factors are appended to xi. kp and kd assume position actuators in MuJoCo's affine form (gainprm kp, biasprm 0 -kp -kd).
 meta["dr"]["action_delay"] = p: with probability p an episode applies every action one control step late (20 ms; the
 evaluation delays if p >= 0.5). The flag is the last entry of xi, and the world model is given the applied action.
+meta["dr"]["payload"] = [{"bodies": [id] or [id, id of its mirror image], "mass": [lo, hi], "com_lo": [x, y, z], "com_hi":
+[x, y, z]}, ...]: bodies of the MJCF whose mass and center of mass (in the body frame; y range mirrored for the second
+body of a pair) are drawn once per world, the inertia scaled by mass / nominal mass; the evaluation takes the middles. The
+values (mass, CoM per body) follow the actuator factors in xi. As MuJoCo computes them once from the nominal model, the
+subtree masses and the inverse weights that scale the constraint softness stay the nominal model's.
 
 A detail reproduced on purpose: BlinkMimic selects the ground as the geoms of body 0, but mjlab puts the plane on its own
 body, so the selection is empty and the floor keeps friction 1.0. MuJoCo takes the larger friction of a contact pair, so the
@@ -34,7 +39,7 @@ ACTUATOR_FIELDS = {"kp": ("actuator_gainprm", "actuator_biasprm"), "kd": ("actua
 
 class XiLayout:
     """Layout of the sim context xi = (friction 1, joint offsets J, CoM offset 3, then J factors per randomized actuator
-    constant) and its normalization (center and half-range, as blinkmimic.dr.XiLayout)."""
+    constant, then mass and CoM per payload body) and its normalization (center and half-range, as blinkmimic.dr.XiLayout)."""
 
     def __init__(self, meta: dict, goal_mask_share: float = 0.0):
         J = len(meta["joint_names"])
@@ -53,6 +58,17 @@ class XiLayout:
             self.dim += J
             self.center = np.append(self.center, np.full(J, (lo + hi) / 2, np.float32))
             self.scale = np.append(self.scale, np.full(J, max((hi - lo) / 2, 1e-6), np.float32))
+        self.payload = []  # per entry: (body ids, slice of xi, lo, hi), lo and hi as (bodies, 4): mass, CoM
+        for e in meta["dr"].get("payload", []):
+            n = len(e["bodies"])
+            assert n in (1, 2) and meta["com_body_id"] not in e["bodies"], e
+            lo = np.tile(np.asarray([e["mass"][0], *e["com_lo"]], np.float32), (n, 1))
+            hi = np.tile(np.asarray([e["mass"][1], *e["com_hi"]], np.float32), (n, 1))
+            lo[1:, 2], hi[1:, 2] = -hi[1:, 2], -lo[1:, 2]  # the second body of a pair is the first one's mirror image
+            self.payload.append((np.asarray(e["bodies"]), slice(self.dim, self.dim + 4 * n), lo, hi))
+            self.dim += 4 * n
+            self.center = np.append(self.center, ((lo + hi) / 2).ravel())
+            self.scale = np.append(self.scale, np.maximum((hi - lo) / 2, 1e-6).ravel())
         self.mask_p, self.mask = goal_mask_share, None
         if self.mask_p > 0:
             self.mask = self.dim  # xi[..., mask] = 1: this episode's policy sees only the command, not the reference
@@ -118,6 +134,8 @@ class Sim:
         self.dx0 = mjx.make_data(mj_model, impl="warp", device=device, naconmax=num_envs * meta["sim"]["nconmax"], njmax=meta["sim"]["njmax"])
         self.model_axes = jax.tree.map(lambda _: None, self.mx).replace(geom_friction=0, body_ipos=0)
         self.model_axes = self.model_axes.replace(**{f: 0 for n in self.layout.factors for f in ACTUATOR_FIELDS[n]})
+        if self.layout.payload:
+            self.model_axes = self.model_axes.replace(body_mass=0, body_inertia=0)
 
     # ------------------------------------------------------------------ setup
     def init(self, key, motion):
@@ -141,10 +159,10 @@ class Sim:
         ip = jnp.broadcast_to(self.mx.body_ipos, (N,) + self.mx.body_ipos.shape)
         ip = ip.at[:, self.com_body].add(com)
         model_b = self.mx.replace(geom_friction=fr, body_ipos=ip)
+        b = lambda name: jnp.broadcast_to(getattr(model_b, name), (N,) + getattr(self.mx, name).shape)  # noqa: E731
         for (name, (sl, lo, hi)), k in zip(L.factors.items(), jax.random.split(ka, 4)):
             fac = jnp.ones((N, self.J)) if self.eval_mode else jax.random.uniform(k, (N, self.J), minval=lo, maxval=hi)
             xi = xi.at[:, sl].set(fac)
-            b = lambda name: jnp.broadcast_to(getattr(model_b, name), (N,) + getattr(self.mx, name).shape)  # noqa: E731
             if name == "kp":
                 model_b = model_b.replace(actuator_gainprm=b("actuator_gainprm").at[:, self.act, 0].multiply(fac),
                                           actuator_biasprm=b("actuator_biasprm").at[:, self.act, 1].multiply(fac))  # fmt: skip
@@ -152,6 +170,13 @@ class Sim:
                 model_b = model_b.replace(actuator_biasprm=b("actuator_biasprm").at[:, self.act, 2].multiply(fac))
             else:
                 model_b = model_b.replace(**{f"dof_{name}": b(f"dof_{name}").at[:, self.dadr].multiply(fac)})
+        for i, (bodies, sl, lo, hi) in enumerate(L.payload):
+            pl = jnp.broadcast_to((lo + hi) / 2, (N,) + lo.shape)
+            if not self.eval_mode:
+                pl = jax.random.uniform(jax.random.fold_in(key, 2 + i), pl.shape, minval=lo, maxval=hi)
+            xi = xi.at[:, sl].set(pl.reshape(N, -1))
+            model_b = model_b.replace(body_mass=b("body_mass").at[:, bodies].set(pl[..., 0]), body_ipos=b("body_ipos").at[:, bodies].set(pl[..., 1:]),
+                                      body_inertia=b("body_inertia").at[:, bodies].multiply(pl[..., :1] / self.m.body_mass[bodies, None]))  # fmt: skip
         nb = motion.num_bins
         data = jax.vmap(lambda q: self.dx0.replace(qpos=q))(jnp.tile(self.dx0.qpos[None], (N, 1)))
         st = {

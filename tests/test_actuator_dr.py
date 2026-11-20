@@ -73,6 +73,7 @@ d = st["data"]
 data = d.replace(qpos=same(d.qpos), qvel=same(d.qvel) + 1.0, ctrl=same(d.ctrl))  # moving joints: kd and friction loss act
 target = jnp.broadcast_to(sim.default_q + 0.2, (N, J))
 fields = ("geom_friction", "body_ipos") + tuple({f for fs in ACTUATOR_FIELDS.values() for f in fs})
+fields += ("body_mass", "body_inertia") if L.payload else ()  # a robot with payload randomization: per world as well
 model_same = model_b.replace(**{f: same(getattr(model_b, f)) for f in fields})
 physics = jax.jit(sim.physics)
 q = np.asarray(physics(model_same, data, target).qpos)
