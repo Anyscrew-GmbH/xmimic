@@ -73,6 +73,11 @@ class Config:
     mirror_clips: float = 0.0  # share of the training episodes that track the left/right mirror image of their clip,
     #                            mirrored when read (motion.MirroredMotion: no second copy of the clips; 0: off)
     log_dir: str = "runs/xmimic"
+    wandb_project: str = ""  # Weights & Biases project of the train log's numbers and the options ("": off, unless WANDB_PROJECT is
+    #                          set); wandb_log.py lists what is sent and what not
+    wandb_entity: str = ""  # "": WANDB_ENTITY, else wandb's default
+    wandb_name: str = ""  # run name; "": WANDB_NAME, else a generated one
+    wandb_mode: str = ""  # online | offline | disabled; "": WANDB_MODE, else online
     max_minutes: float = 0.0  # stop after this much training time (0: run all iterations)
     # ---- layout and learner
     layout: str = "1GPU"  # 1GPU | FP1 | FP | AL | ALP | AWL | AWLP (README, "How it gets fast")
