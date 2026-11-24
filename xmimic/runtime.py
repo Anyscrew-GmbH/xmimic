@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from . import nets
+from . import nets, wandb_log
 
 
 def freeze_gc():
@@ -86,6 +86,7 @@ class RunLog:
         self.cols = self.COLS + list(extra_cols)
         self.f = open(os.path.join(cfg.log_dir, "train_log.csv"), "a")
         self.f.write(",".join(self.cols) + "\n")
+        wandb_log.start(args_meta, cfg.log_dir)
         self.acc, self.t_log, self.it_log, self.decay_at = [], time.time(), 0, -1
         self.unflat = make_unflat(avg_template)
         self.pool = concurrent.futures.ThreadPoolExecutor(1)
@@ -139,6 +140,7 @@ class RunLog:
                    "pi_lr": float(s["pi_lr"][-1]), "nonfinite": int(s["nonfinite"][-1]), **(extra or {})}  # fmt: skip
             self.f.write(",".join(f"{row[k]:.6g}" if isinstance(row[k], float) else str(row[k]) for k in self.cols) + "\n")
             self.f.flush()
+            wandb_log.log(row, step=it)
             probe = (f" | probe fails {int(s['ep_n_fail'][-1])}" if "ep_n_fail" in s else "") + "".join(
                 f" | {k} {v}" for k, v in (extra or {}).items())
             print(f"it {it} | {row['wall_min']:.2f} min | wm {row['wm']:.4f} e8 {row['wm8']:.4f} | pi {row['pi']:.3f} v {row['v']:.4f} "

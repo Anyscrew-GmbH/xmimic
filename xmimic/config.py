@@ -68,6 +68,11 @@ class Config:
     goal_mask_share: float = 0.0  # share of episodes whose policy sees only a command as a joystick gives it: the root's
     #                               smoothed planar velocity and yaw rate (motion.py; 0: off; 1GPU layout only)
     log_dir: str = "runs/xmimic"
+    wandb_project: str = ""  # Weights & Biases project of the train log's numbers and the options ("": off, unless WANDB_PROJECT is
+    #                          set); wandb_log.py lists what is sent and what not
+    wandb_entity: str = ""  # "": WANDB_ENTITY, else wandb's default
+    wandb_name: str = ""  # run name; "": WANDB_NAME, else a generated one
+    wandb_mode: str = ""  # online | offline | disabled; "": WANDB_MODE, else online
     max_minutes: float = 0.0  # stop after this much training time (0: run all iterations)
     # ---- layout and learner
     layout: str = "1GPU"  # 1GPU | FP1 | FP | AL | ALP | AWL | AWLP (README, "How it gets fast")
