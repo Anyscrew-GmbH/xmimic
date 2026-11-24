@@ -7,13 +7,21 @@ is fed made-up statistics of a few log intervals.
            and system metrics; the flags reach wandb.init
   config   the configuration sent holds no option that names a file or directory (no key naming one, no value that looks
            like a path), and keeps the hyperparameters
+  fallback a wandb that cannot start online (login, network) leaves one warning and an offline run; one that cannot start at
+           all, or fails while logging, leaves a warning and the run log goes on
+  real     with the wandb package installed: an offline run's record (what `wandb sync` uploads) holds the numbers and the
+           filtered configuration, not a path, console line, program or host name; no output, requirements, metadata or code file
 
     JAX_PLATFORMS=cpu python tests/test_wandb_log.py
 """
 
+import contextlib
 import csv
 import dataclasses
+import glob
+import io
 import os
+import socket
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -36,13 +44,15 @@ STATS = ("sim_steps", "wm", "wm8", "pi", "v", "ir", "gn", "surv", "r", "n_coll",
 class FakeWandb:
     """wandb.Settings, wandb.init and run.log, recorded."""
 
-    def __init__(self):
-        self.init_kw, self.logged, self.metrics = None, [], {}
+    def __init__(self, fail=()):
+        self.init_kw, self.logged, self.metrics, self.fail = None, [], {}, fail  # fail: modes whose init raises, or "log"
 
     def Settings(self, **kw):
         return kw
 
     def init(self, **kw):
+        if kw["mode"] in self.fail:
+            raise RuntimeError("stand-in: cannot start")
         self.init_kw = kw
         return self
 
@@ -50,16 +60,18 @@ class FakeWandb:
         self.metrics[name] = step_metric
 
     def log(self, data, step=None):
+        if "log" in self.fail:
+            raise RuntimeError("stand-in: cannot log")
         self.logged.append((step, data))
 
 
-def run(flags, intervals=3):
-    """A RunLog of a config with `flags`, fed `intervals` log intervals: (the fake wandb, train_log.csv rows, the config)."""
-    fake, wandb_log._run = FakeWandb(), None
+def run(flags, intervals=3, fail=()):
+    """A RunLog of a config with `flags`, fed `intervals` log intervals: (the fake wandb, train_log.csv rows, the config, the output)."""
+    fake, wandb_log._run, out = FakeWandb(fail), None, io.StringIO()
     xm = SimpleNamespace(obs_dim=3, ref=None, motion=SimpleNamespace(goal=lambda f, k: jnp.zeros((4, 2))),
                          layout=SimpleNamespace(dim=0, masked=lambda g, *a: g))  # fmt: skip
     rng = np.random.default_rng(0)
-    with mock.patch.dict(sys.modules, {"wandb": fake}), tempfile.TemporaryDirectory() as d:
+    with mock.patch.dict(sys.modules, {"wandb": fake}), tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
         cfg = parse_args(["--log_every", "2", "--ckpt_every", NEVER, "--iterations", NEVER, "--log_dir", d] + flags)
         log = RunLog(xm, cfg, 0.0, {"w": np.zeros(3)}, {**dataclasses.asdict(cfg), "gpus": cfg.gpus})
         for it in range(1, 2 * intervals + 1):
@@ -69,17 +81,17 @@ def run(flags, intervals=3):
         assert fake.init_kw is None or fake.init_kw["dir"] == d
         rows = list(csv.DictReader(open(os.path.join(d, "train_log.csv"))))
     wandb_log._run = None
-    return fake, rows, cfg
+    return fake, rows, cfg, out.getvalue()
 
 
 def test_wandb_log():
     with mock.patch.dict(os.environ, {"WANDB_PROJECT": ""}):
-        fake, rows, _ = run([])
+        fake, rows, _, _ = run([])
     assert fake.init_kw is None and not fake.logged and len(rows) == 3
     print(f"off: {len(rows)} train-log rows, wandb not started")
 
     paths = ["--motion_dir", "clips/set_a", "--robot_dir", "robots/r"]
-    fake, rows, cfg = run(["--wandb_project", "proj", "--wandb_entity", "team", "--wandb_name", "run-a", "--wandb_mode", "offline"] + paths)
+    fake, rows, cfg, _ = run(["--wandb_project", "proj", "--wandb_entity", "team", "--wandb_name", "run-a", "--wandb_mode", "offline"] + paths)
     kw = fake.init_kw
     assert (kw["project"], kw["entity"], kw["name"], kw["mode"]) == ("proj", "team", "run-a", "offline")
     assert kw["settings"]["console"] == "off" and not kw["settings"]["save_code"] and kw["settings"]["disable_git"] and kw["settings"]["x_disable_meta"]
@@ -98,6 +110,47 @@ def test_wandb_log():
           f"{sorted(set(dataclasses.asdict(cfg)) - set(config))}")
 
 
+def test_fallback():
+    online = ["--wandb_project", "proj", "--wandb_mode", "online"]
+    fake, rows, _, out = run(online, fail=("online",))
+    assert fake.init_kw["mode"] == "offline" and out.count("[wandb] warning") == 1 and "logging offline to" in out
+    assert len(fake.logged) == len(rows) == 3
+    for fail in (("online", "offline"), ("log",)):
+        fake, rows, _, out = run(online, fail=fail)
+        assert not fake.logged and out.count("[wandb] warning") == len(fail) and len(rows) == 3, out
+    print("fallback: online start failed -> one warning, offline run with every row; no start at all, or a failing log -> "
+          "warnings, every train-log row written")
+
+
+def test_real():
+    try:
+        import wandb  # noqa: F401
+    except ImportError:
+        print("real: wandb not installed, skipped")
+        return
+    wandb_log._run = None
+    with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"WANDB_SILENT": "true"}):
+        config = {"wandb_project": "proj", "wandb_mode": "offline", "lr": 0.001, "data_dir": "x/y", "init_ckpt": "a.npz"}
+        wandb_log.start(config, d)
+        print("console output that must stay local")
+        for it in (1, 2):
+            wandb_log.log({"it": it, "loss": 1.0 / it, "name": "x/y"}, step=it)
+        wandb_log._run.finish()
+        wandb_log._run = None
+        (record,) = glob.glob(os.path.join(d, "wandb", "offline-run-*", "run-*.wandb"))  # what `wandb sync` uploads
+        run_dir = os.path.dirname(record)
+        others = [f for f in glob.glob(os.path.join(run_dir, "**"), recursive=True) if os.path.isfile(f) and f != record]
+        assert all(os.path.relpath(f, run_dir).startswith("logs" + os.sep) for f in others), others  # wandb's local debug logs only
+        data = open(record, "rb").read()
+        sent = [b"lr", b"loss", b"0.001"]
+        kept = [b"x/y", b"a.npz", b"data_dir", b"init_ckpt", b"must stay local", b"test_wandb_log", socket.gethostname().encode()]
+        assert all(x in data for x in sent) and not [x for x in kept if x in data], [x for x in kept if x in data]
+    print(f"real: wandb {wandb.__version__} offline run: its record holds the numbers and the filtered configuration; no path, console line, "
+          "program name or host name, and no output, requirements, metadata or code file")
+
+
 if __name__ == "__main__":
     test_wandb_log()
+    test_fallback()
+    test_real()
     print("\nall checks passed")
