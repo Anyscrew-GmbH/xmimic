@@ -25,7 +25,7 @@ from .config import Config
 from .kin import Kinematics
 from .mdp import MDP, flatten_state, inv_dim, obs_dim, state_dim, unflatten_state
 from .model import feet_of, load_model
-from .motion import CONTROL_DT, GOAL_Q_OFFSET, load_motion
+from .motion import CONTROL_DT, GOAL_Q_OFFSET, load_motion, mirrored
 from .sim import Sim
 
 # floors of the world model's per-dimension error scale: position, rotation, linear and angular velocity (then joints)
@@ -44,7 +44,7 @@ def flat32(tree):
 
 class Mirror:
     """Sagittal mirror M = diag(1, -1, 1) of states, joints (left/right swapped, signs from the joint axes) and the sim
-    context (blinkmimic/mirror.py): world-model data augmentation.
+    context (blinkmimic/mirror.py): world-model data augmentation, and the reference clips with --mirror_clips.
 
     A rotation by q about the axis a mirrors to a rotation by q about -M a. So a joint whose mirror partner (itself, for a
     joint on the centerline) has the axis -M a keeps its angle's sign, and one whose partner has M a flips it. For the G1
@@ -53,14 +53,17 @@ class Mirror:
     def __init__(self, meta, layout):
         names = list(meta["joint_names"])
         axis = {names[j]: np.asarray(a) for j, a in zip(meta["kin_joint_idx"], meta["kin_axes"]) if j >= 0}
+        swap = lambda n: n.replace("left_", "@").replace("right_", "left_").replace("@", "right_")  # noqa: E731
         perm, sign = [], []
         for n in names:
-            partner = n.replace("left_", "@").replace("right_", "left_").replace("@", "right_")
+            partner = swap(n)
             perm.append(names.index(partner))
             s = -float(axis[partner] @ (axis[n] * [1.0, -1.0, 1.0]))
             assert abs(abs(s) - 1) < 1e-4, f"{n} and {partner} are not mirror images: axes {axis[n]}, {axis[partner]}"
             sign.append(float(np.sign(s)))
         self.perm, self.sign = np.asarray(perm), np.asarray(sign, np.float32)
+        bodies = list(meta["tracked_bodies"])  # tracked bodies swapped left / right (--mirror_clips; None: one has no partner)
+        self.body_perm = np.asarray([bodies.index(swap(b)) for b in bodies]) if all(swap(b) in bodies for b in bodies) else None
         self.M = np.asarray([1.0, -1.0, 1.0], np.float32)
         self.layout = layout
 
@@ -117,6 +120,8 @@ class XMimic:
         self.make_probe_tiles()
         if self.probes:
             self.penv = Sim(self.mj_model, meta, self.P, self.mdp, eval_mode=True, gamma=c.gamma, goal_mask_share=c.goal_mask_share)
+        if c.mirror_clips > 0:  # after the probe tiles: the probes sweep the original clips
+            self.motion = mirrored(self.motion, self.mirror, self.kin, feet, c.mirror_clips)
 
     def make_probe_tiles(self):
         """Probe worlds: one per tile of ``eprobe_tile`` frames of every clip (ep_tile: each tile's first frame), and the
