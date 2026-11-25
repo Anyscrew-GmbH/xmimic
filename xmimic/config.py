@@ -70,6 +70,8 @@ class Config:
     pi_hold: int = 0  # iterations at the start with policy LR 0, so the fresh world model and critic learn first (init_policy)
     goal_mask_share: float = 0.0  # share of episodes whose policy sees only a command as a joystick gives it: the root's
     #                               smoothed planar velocity and yaw rate (motion.py; 0: off; 1GPU layout only)
+    mirror_clips: float = 0.0  # share of the training episodes that track the left/right mirror image of their clip,
+    #                            mirrored when read (motion.MirroredMotion: no second copy of the clips; 0: off)
     log_dir: str = "runs/xmimic"
     max_minutes: float = 0.0  # stop after this much training time (0: run all iterations)
     # ---- layout and learner

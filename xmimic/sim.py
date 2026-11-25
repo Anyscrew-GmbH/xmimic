@@ -219,7 +219,7 @@ class Sim:
         start = motion.bin_start[bins]
         end = jnp.minimum(start + BIN_FRAMES, motion.clip_end[motion.bin_clip[bins]])
         f = start + (jax.random.uniform(kf, (self.N,)) * (end - start)).astype(jnp.int32)
-        return f, bins, w_avg
+        return motion.sample_mirror(kf, f), bins, w_avg
 
     def reset_masked(self, motion, st, mask, key, frames=None):
         """Reset the worlds where mask is true onto reference frames (sampled, or ``frames``); others stay bitwise unchanged."""

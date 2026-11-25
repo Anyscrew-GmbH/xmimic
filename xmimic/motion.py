@@ -160,6 +160,92 @@ class Motion:
     def ref_state(self, f):
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]
 
+    def sample_mirror(self, key, f):
+        """Reset frames f as they are (MirroredMotion moves a share of them to the mirror image)."""
+        return f
+
+
+class _Frames:
+    """``motion.<field>[i]`` of a MirroredMotion: index i of the original, or i - n of it mirrored by ``fn(x, i - n)`` where
+    i >= n."""
+
+    def __init__(self, base, n, fn):
+        self.base, self.n, self.fn = base, n, fn
+
+    def __getitem__(self, i):
+        i = jnp.asarray(i)
+        m = i >= self.n
+        g = jnp.where(m, i - self.n, i)
+        x = self.base[g]
+        return jnp.where(m.reshape(m.shape + (1,) * (x.ndim - m.ndim)), self.fn(x, g), x)
+
+
+@partial(jax.tree_util.register_dataclass, data_fields=["base", "perm", "sign", "body_perm", "body_C", "body_d", "foot_perm"],
+         meta_fields=["share"])  # fmt: skip
+@dataclasses.dataclass
+class MirroredMotion:
+    """A Motion and its left/right mirror image as one library of twice the frames, without a second copy on the device
+    (--mirror_clips). Frame f >= N (N = base.num_frames) is frame f - N mirrored at read time, by the rules of
+    algorithm.Mirror.state (M = diag(1, -1, 1); joints and tracked bodies swap sides); clip c >= C is clip c - C's mirror.
+    A clip and its mirror share their reset bins and bin statistics. ``sample_mirror`` moves each reset frame to its mirror
+    image with probability ``share``. Read ``motion.<field>[f]`` as for a Motion; whole arrays are only in ``base``."""
+
+    base: Motion
+    perm: jax.Array
+    sign: jax.Array
+    body_perm: jax.Array
+    body_C: jax.Array  # per tracked body: the constant rotation from the mirrored partner's frame to the body's own
+    body_d: jax.Array  # ... and its origin's constant offset from the mirrored partner's origin, in its own frame
+    foot_perm: jax.Array
+    share: float
+
+    goal_dim, future_frames, goal, goal_cmd, ref_state = Motion.goal_dim, Motion.future_frames, Motion.goal, Motion.goal_cmd, Motion.ref_state
+
+    @property
+    def num_frames(self):
+        return 2 * self.base.num_frames
+
+    def sample_mirror(self, key, f):
+        return f + self.base.num_frames * (jax.random.uniform(jax.random.fold_in(key, 1), f.shape) < self.share)
+
+    def __getattr__(self, name):
+        if name.startswith("_") or name == "base":
+            raise AttributeError(name)
+        b, n, C = self.base, self.base.num_frames, len(self.base.names)
+        Mv = jnp.asarray([1.0, -1.0, 1.0])
+        vec, pseudo, rot = (lambda x, g=None: x * Mv), (lambda x, g=None: -(x * Mv)), (lambda x, g=None: x * Mv[:, None] * Mv[None, :])  # noqa: E731
+        bodies = lambda x: x[..., self.body_perm, :]  # noqa: E731
+        R = lambda g: rot(b.body_R[g][..., self.body_perm, :, :]) @ self.body_C  # noqa: E731
+        d = lambda g: (R(g) @ self.body_d[:, :, None])[..., 0]  # noqa: E731
+        w = lambda g: pseudo(bodies(b.body_w[g]))  # noqa: E731
+        fn = {"root_p": vec, "root_v": vec, "root_v_local": vec, "root_w": pseudo, "root_w_local": pseudo, "root_R": rot, "cmd_yaw_R": rot,
+              "q": lambda x, g: x[..., self.perm] * self.sign, "qd": lambda x, g: x[..., self.perm] * self.sign,
+              "body_p": lambda x, g: vec(bodies(x)) + d(g), "body_v": lambda x, g: vec(bodies(x)) + jnp.cross(w(g), d(g)),
+              "body_w": lambda x, g: w(g), "body_R": lambda x, g: R(g), "cmd_v": lambda x, g: x * jnp.asarray([1.0, -1.0]),
+              "cmd_w": lambda x, g: -x, "ref_contact": lambda x, g: x[..., self.foot_perm], "frame_bin": lambda x, g: x,
+              "clip_id": lambda x, g: x + C}  # fmt: skip
+        if name in fn:
+            return _Frames(getattr(b, name), n, fn[name])
+        if name in ("clip_start", "clip_end"):
+            return _Frames(getattr(b, name), C, lambda x, g: x + n)
+        return getattr(b, name)  # bins, names, sizes: those of the original clips
+
+
+def mirrored(motion: Motion, mirror, kin, feet: list[int], share: float) -> MirroredMotion:
+    """``motion`` and its mirror image (``mirror``: algorithm.Mirror of the robot) for --mirror_clips ``share``."""
+    assert mirror.body_perm is not None, "--mirror_clips: every tracked body needs its left / right partner among the tracked bodies"
+    o = jnp.zeros((1, 3))
+    pz, Rz, _, _ = kin.forward(o, jnp.eye(3)[None], o, o, jnp.zeros((1, len(kin.q_lo))), jnp.zeros((1, len(kin.q_lo))))
+    Mm, bp = np.asarray([1.0, -1.0, 1.0], np.float32), list(mirror.body_perm)
+    pz, Rz = np.asarray(pz[0]), np.asarray(Rz[0])
+    # body b in the mirrored pose: rotation M R_partner M C_b, origin M p_partner + R_b d_b (a frame origin off the robot's
+    # plane of symmetry); the zero pose is its own mirror image, which fixes C_b and d_b
+    C = np.swapaxes(Rz[bp] * Mm[:, None] * Mm[None, :], -1, -2) @ Rz
+    d = (np.swapaxes(Rz, -1, -2) @ (pz - pz[bp] * Mm)[:, :, None])[..., 0]
+    return MirroredMotion(base=motion, perm=jnp.asarray(mirror.perm), sign=jnp.asarray(mirror.sign), body_perm=jnp.asarray(bp),
+                          body_C=jnp.asarray(C, jnp.float32), body_d=jnp.asarray(d, jnp.float32),
+                          foot_perm=jnp.asarray([feet.index(bp[i]) for i in feet]), share=float(share))  # fmt: skip
+
 
 def load_motion(motion_dir: str, kin, feet: list[int], margin: float = 0.015, vmax: float = 0.5, quant: float = 0.05) -> Motion:
     """All *.csv clips of ``motion_dir`` in sorted order (blinkmimic.motion.MotionLib.from_dir plus set_ref_contact(feet))."""
