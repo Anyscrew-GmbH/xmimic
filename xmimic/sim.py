@@ -215,7 +215,9 @@ class Sim:
             probs = (1 - self.fail_reset) * probs + self.fail_reset * jnp.where(fail.sum() > 0, fail, probs)
         probs = (1 - st["focus_share"]) * probs + st["focus_share"] * st["focus_q"]
         kb, kf = jax.random.split(key)
-        bins = jax.random.categorical(kb, jnp.log(jnp.maximum(probs, 1e-30)), shape=(self.N,))
+        # inverse CDF: categorical(shape=(N,)) draws N x num_bins Gumbel noise, gigabytes with tens of thousands of clips
+        cdf = jnp.cumsum(probs)
+        bins = jnp.minimum(jnp.searchsorted(cdf, jax.random.uniform(kb, (self.N,)) * cdf[-1], side="right"), nb - 1)
         start = motion.bin_start[bins]
         end = jnp.minimum(start + BIN_FRAMES, motion.clip_end[motion.bin_clip[bins]])
         f = start + (jax.random.uniform(kf, (self.N,)) * (end - start)).astype(jnp.int32)

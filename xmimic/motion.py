@@ -286,9 +286,14 @@ def load_motion(motion_dir: str, kin, feet: list[int], margin: float = 0.015, vm
     cat = lambda xs: jnp.asarray(np.concatenate(xs).astype(np.float32))  # noqa: E731
     root_p, root_R, root_v, root_w, q, qd = cat(ps), cat(Rs), cat(vs), cat(ws), cat(js), cat(jds)
     fk = jax.jit(kin.forward)
-    out = [fk(root_p[s:s + 65536], root_R[s:s + 65536], root_v[s:s + 65536], root_w[s:s + 65536], q[s:s + 65536], qd[s:s + 65536])
-           for s in range(0, len(clip_id), 65536)]  # fmt: skip
-    body_p, body_R, body_v, body_w = (jnp.concatenate([o[i] for o in out]) for i in range(4))
+    body = None  # filled on the host chunk by chunk: a concatenate on the device would need twice the bodies' memory
+    for s in range(0, len(clip_id), 65536):
+        o = jax.device_get(fk(root_p[s:s + 65536], root_R[s:s + 65536], root_v[s:s + 65536], root_w[s:s + 65536], q[s:s + 65536],
+                              qd[s:s + 65536]))  # fmt: skip
+        body = body or [np.empty((len(clip_id),) + x.shape[1:], x.dtype) for x in o]
+        for b, x in zip(body, o):
+            b[s : s + len(x)] = x
+    body_p, body_R, body_v, body_w = (jnp.asarray(b) for b in body)
     Rt = tr3(root_R)
     bin_clip, bin_start = [], []
     for c in range(len(lens)):
