@@ -65,6 +65,9 @@ class Config:
     seed: int = 0
     motion_dir: str = "data/lafan1_g1"
     robot_dir: str = ""  # directory with the robot's scene.xml and meta.json ("": the bundled G1, assets/g1)
+    init_policy: str = ""  # a checkpoint (ckpt_*.npz) whose averaged policy and normalizers start the policy, e.g. to go on
+    #                        training on another motion set; the world model, critic and optimizers start fresh ("": off)
+    pi_hold: int = 0  # iterations at the start with policy LR 0, so the fresh world model and critic learn first (init_policy)
     goal_mask_share: float = 0.0  # share of episodes whose policy sees only a command as a joystick gives it: the root's
     #                               smoothed planar velocity and yaw rate (motion.py; 0: off; 1GPU layout only)
     log_dir: str = "runs/xmimic"

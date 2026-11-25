@@ -83,6 +83,16 @@ class Mirror:
         return xi.at[..., L.com.start + 1].set(-xi[..., L.com.start + 1])
 
 
+def load_policy(path, pi, pi_b):
+    """(pi, pi_b) shaped like the given ones, with the averaged policy and normalizers of a checkpoint (runtime.export_policy)."""
+    from .evaluate import load_ckpt
+
+    params, bufs, _ = load_ckpt(path)
+    new = jax.tree.map(lambda x, y: jnp.asarray(y, x.dtype), (pi, pi_b), (params, bufs))
+    assert jax.tree.map(jnp.shape, new) == jax.tree.map(jnp.shape, (pi, pi_b)), f"{path}: other network sizes"
+    return new
+
+
 class XMimic:
     """The model, the motion library, the simulators and every step of the training iteration as jittable functions."""
 
@@ -153,6 +163,9 @@ class XMimic:
             "dec_nd": jnp.zeros((), jnp.float32), "dec_rs": jnp.zeros((), jnp.float32),
             "nonfinite": jnp.zeros((), jnp.int32), "sim_steps": jnp.zeros((), jnp.float32),
         }  # fmt: skip
+        if c.init_policy:
+            pi, pi_b = load_policy(c.init_policy, pi, pi_b)
+            carry = {**carry, "pi": pi, "pi_b": pi_b, "avg": jax.tree.map(jnp.copy, (pi, pi_b)), "opt_pi": optim.init(pi, self.pi_mask)}
         consts = {"motion": self.motion, "model": model_b}
         if self.probes:
             model_p, pst = self.penv.init(ks[5], self.motion)
@@ -354,7 +367,7 @@ class XMimic:
         """The policy LR multiplier: pi_lr_mult until the decay trigger, then a linear ramp down to 1."""
         c = self.cfg
         ramp = c.pi_lr_mult + (1.0 - c.pi_lr_mult) * jnp.minimum(1.0, (it - decay_at) / max(c.lr_decay_len, 1))
-        return jnp.where(decay_at >= 0, ramp, c.pi_lr_mult)
+        return jnp.where(it < c.pi_hold, 0.0, jnp.where(decay_at >= 0, ramp, c.pi_lr_mult))
 
     def decay_tick(self, carry, it, cstats):
         """BlinkMimic's LR-decay trigger at the end of each log interval (it + 1 a multiple of log_every): the mean normalized
