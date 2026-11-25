@@ -98,12 +98,14 @@ def test_wandb_log():
     assert kw["settings"]["x_disable_stats"] and not kw["settings"]["x_save_requirements"]
     assert [s for s, _ in fake.logged] == [int(r["iteration"]) for r in rows] == [2, 4, 6]
     for (_, sent), row in zip(fake.logged, rows):
-        assert set(sent) == set(RunLog.COLS) and all(np.isclose(float(row[k]), v, rtol=1e-5) for k, v in sent.items()), (sent, row)
+        own = {k.split("/", 1)[1]: v for k, v in sent.items() if not k.startswith("overview/") and k != "metrics/steps_per_s"}
+        assert set(own) == set(RunLog.COLS) and all(np.isclose(float(row[k]), v, rtol=1e-5) for k, v in own.items()), (sent, row)
+        assert "critic/v" in sent and "actor/pi" in sent and "world_model/wm" in sent and "overview/ep_ret" in sent, sent
     print(f"run: {len(rows)} rows sent at iterations {[s for s, _ in fake.logged]}, {len(RunLog.COLS)} numbers each, equal to train_log.csv")
 
     config = kw["config"]
     names_file = lambda s: wandb_log.PATH_KEY.search(s) or wandb_log.PATH_VALUE.search(s)  # noqa: E731
-    assert not any(names_file(k) or (isinstance(v, str) and names_file(v)) for k, v in config.items()), config
+    assert not any((names_file(k) and not isinstance(v, (int, float))) or (isinstance(v, str) and names_file(v)) for k, v in config.items()), config  # numbers kept (mirror_clips)
     assert not {"motion_dir", "robot_dir", "log_dir"} & set(config) and not any(k.startswith("wandb") for k in config)
     assert {"lr", "pi_clip_value", "horizon", "num_envs", "goal_mask_share", "gpus"} <= set(config) and config["num_envs"] == cfg.num_envs
     print(f"config: {len(config)} options sent, none naming a file or directory; dropped: "
